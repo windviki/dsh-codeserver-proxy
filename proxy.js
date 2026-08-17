@@ -54,6 +54,12 @@ function rewriteJs(body, base) {
   // match never runs first and produces a double-prefixed string. The base path
   // is inserted after the opening quote/backtick in every case.
   const rules = [
+    // The base path rewrites `/api` (the RPC channel) to `/proxy/3100/api`,
+    // but connection's assertTarget rejects a channel with more than one slash
+    // (`CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/`). Widen the class to accept
+    // `/`, so the rewritten multi-segment channel passes validation while the
+    // URL built from it (`${channel}/${endpoint}`) still carries the base path.
+    ["CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~-]+$/", "CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~\\/-]+$/"],
     ['"/api/events.host"', '"' + base + '/api/events.host"'],
     ['"/api/events.mux"', '"' + base + '/api/events.mux"'],
     ['"/api/respond"', '"' + base + '/api/respond"'],
