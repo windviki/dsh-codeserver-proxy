@@ -92,12 +92,22 @@ function rewriteJs(body, base) {
     ['"/api/events.host"', '"' + base + '/api/events.host"'],
     ['"/api/events.mux"', '"' + base + '/api/events.mux"'],
     ['"/api/respond"', '"' + base + '/api/respond"'],
+    // Any other /api/<plugin>/... route (dsh-ssh, skin-center, ...): prefix the
+    // whole root-absolute /api/ subpath family, not just the fixed ones above.
+    ['"/api/', '"' + base + '/api/'],
     ["`/api/${method}`", `\`${base}/api/\${method}\``],
+    // Backtick form of the same plugin-API family (`/api/pet`, ...).
+    ["`/api/", `\`${base}/api/`],
     ['"/plugins/events"', '"' + base + '/plugins/events"'],
+    // Plugin client bundles fetch their own /plugins/<id>/... assets at runtime
+    // (e.g. a ticker widget); rewriteHtml already covers the HTML-side refs.
+    ['"/plugins/', '"' + base + '/plugins/'],
     // dshmarket client bundle references its HTTP routes (`/dsh-market/*`,
     // registry/installed/install/...) as root-absolute strings; prefix them
     // so the browser hits them under the proxy base path.
     ['"/dsh-market/', '"' + base + '/dsh-market/'],
+    // vision-toolkit exposes its HTTP routes under /_dsh/vision-toolkit/*.
+    ['"/_dsh/', '"' + base + '/_dsh/'],
     ['"/manifest.webmanifest"', '"' + base + '/manifest.webmanifest"'],
     ['"/favicon.svg"', '"' + base + '/favicon.svg"'],
     ['"/api"', '"' + base + '/api"'],
