@@ -112,6 +112,21 @@ function rewriteJs(body, base) {
     ['"/favicon.svg"', '"' + base + '/favicon.svg"'],
     ['"/api"', '"' + base + '/api"'],
     ["`/api`", `\`${base}/api\``],
+    // Some bundles emit root-absolute routes with single quotes (vision-toolkit
+    // `/_dsh/...`, dsh-pet `/api/pet/pets`); the double-quoted rules above never
+    // match those, so a bare path would resolve against the host root and 404.
+    // Prefix each single-quoted form like its double-quoted twin.
+    ["'/api/events.host'", `'${base}/api/events.host'`],
+    ["'/api/events.mux'", `'${base}/api/events.mux'`],
+    ["'/api/respond'", `'${base}/api/respond'`],
+    ["'/api/", `'${base}/api/`],
+    ["'/plugins/events'", `'${base}/plugins/events'`],
+    ["'/plugins/", `'${base}/plugins/`],
+    ["'/dsh-market/", `'${base}/dsh-market/`],
+    ["'/_dsh/", `'${base}/_dsh/`],
+    ["'/manifest.webmanifest'", `'${base}/manifest.webmanifest'`],
+    ["'/favicon.svg'", `'${base}/favicon.svg'`],
+    ["'/api'", `'${base}/api'`],
   ];
   for (const [from, to] of rules) {
     s = s.split(from).join(to);
