@@ -10,30 +10,60 @@
  * never loads. This proxy sits between code-server and dsh, forwards everything
  * to dsh, and rewrites the served HTML/JS so every root-absolute reference is
  * prefixed with the proxy base path. The UI bytes are otherwise untouched.
+ *
+ *   browser -> code-server /proxy/<port>/ -> this proxy -> dsh web (loopback)
  */
 
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { Buffer } from "node:buffer";
 
-// Minimal .env loader (no shell interpolation). Deployers keep private values
-// — proxy base path, listening/upstream ports, whether to spawn dsh — in a
-// gitignored .env; every variable below has a documented default for the
-// common code-server + dsh-on-loopback layout. Real environment variables
+// ---------------------------------------------------------------------------
+// .env loading
+// ---------------------------------------------------------------------------
+// Minimal, dependency-free .env loader (no shell interpolation). Deployers keep
+// private values — proxy base path, listening/upstream ports, whether to spawn
+// dsh — in a gitignored .env; every variable below has a documented default for
+// the common code-server + dsh-on-loopback layout. Real environment variables
 // always win over .env entries.
-for (const line of existsSync(".env") ? readFileSync(".env", "utf8").split("\n") : []) {
-  const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
-  if (m && m[2] !== "" && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+function loadDotEnv(path) {
+  if (!existsSync(path)) return;
+  for (const rawLine of readFileSync(path, "utf8").split("\n")) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const m = line.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
+    if (!m) continue;
+    let value = m[2].trim();
+    if (value === "") continue;
+    const q = value[0];
+    if ((q === '"' || q === "'") && value.length >= 2 && value.endsWith(q)) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[m[1]] === undefined) process.env[m[1]] = value;
+  }
 }
+loadDotEnv(".env");
 
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 // Variables use the PROXY_ prefix (not DSH_*): dsh boots with this directory as
 // its cwd and refuses any DSH_-prefixed name it finds in a .env there.
-const BASE = process.env.PROXY_BASE || "/proxy/3100";
+function envPort(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (Number.isInteger(n) && n >= 1 && n <= 65535) return n;
+  console.warn(`[dsh-codeserver-proxy] invalid ${name}=${raw}; falling back to ${fallback}`);
+  return fallback;
+}
+
+const BASE = (process.env.PROXY_BASE || "/proxy/3100").replace(/\/+$/, "") || "/";
 const UPSTREAM_HOST = process.env.PROXY_UPSTREAM_HOST || "127.0.0.1";
-const UPSTREAM_PORT = Number(process.env.PROXY_UPSTREAM_PORT || 3000);
-const PORT = Number(process.env.PROXY_PORT || 3100);
+const UPSTREAM_PORT = envPort("PROXY_UPSTREAM_PORT", 3000);
+const PORT = envPort("PROXY_PORT", 3100);
 const SPAWN_DSH = process.env.PROXY_SPAWN_DSH !== "0";
+const LOOPBACK_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -61,91 +91,85 @@ const NO_FORWARD_TRACE = new Set([
   "x-real-ip",
 ]);
 
+// ---------------------------------------------------------------------------
+// Response rewriting
+// ---------------------------------------------------------------------------
+// Order matters: a more specific path must be rewritten before a generic
+// prefix of it (e.g. /api/events.host before /api/, and /api itself last), so
+// a generic rule never runs first and produces a double-prefixed string.
+const HTML_TARGETS = ["/assets/", "/plugins/", "/manifest.webmanifest", "/favicon.svg"];
+const JS_TARGETS = [
+  "/api/events.host",
+  "/api/events.mux",
+  "/api/respond",
+  "/api/",
+  "/plugins/events",
+  "/plugins/",
+  "/dsh-market/",
+  "/_dsh/",
+  "/manifest.webmanifest",
+  "/favicon.svg",
+  "/api",
+];
+
+// Insert `base` after an opening quote for every occurrence of the target
+// root-absolute path, so `"/assets/...` becomes `"/proxy/3100/assets/...` and
+// the rewritten string stays well-formed JSON/HTML/JS.
+function prefixQuoted(s, base, quote, targets) {
+  let out = s;
+  for (const path of targets) out = out.split(quote + path).join(quote + base + path);
+  return out;
+}
+
 function rewriteHtml(body, base) {
-  let s = body;
-  // Each `from` begins with the opening quote of a root-absolute reference; the
-  // base path goes AFTER that quote, so the reference stays well-formed JSON/HTML.
-  const rules = [
-    '"/assets/',
-    '"/plugins/',
-    '"/manifest.webmanifest"',
-    '"/favicon.svg"',
-  ];
-  for (const from of rules) {
-    s = s.split(from).join('"' + base + from.slice(1));
-  }
-  return s;
+  if (base === "/") return body;
+  return prefixQuoted(body, base, '"', HTML_TARGETS);
 }
 
 function rewriteJs(body, base) {
+  if (base === "/") return body;
   let s = body;
-  // Longer/more specific first; shorter generic forms afterwards, so a shorter
-  // match never runs first and produces a double-prefixed string. The base path
-  // is inserted after the opening quote/backtick in every case.
-  const rules = [
-    // The base path rewrites `/api` (the RPC channel) to `/proxy/3100/api`,
-    // but connection's assertTarget rejects a channel with more than one slash
-    // (`CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/`). Widen the class to accept
-    // `/`, so the rewritten multi-segment channel passes validation while the
-    // URL built from it (`${channel}/${endpoint}`) still carries the base path.
-    ["CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~-]+$/", "CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~\\/-]+$/"],
-    ['"/api/events.host"', '"' + base + '/api/events.host"'],
-    ['"/api/events.mux"', '"' + base + '/api/events.mux"'],
-    ['"/api/respond"', '"' + base + '/api/respond"'],
-    // Any other /api/<plugin>/... route (dsh-ssh, skin-center, ...): prefix the
-    // whole root-absolute /api/ subpath family, not just the fixed ones above.
-    ['"/api/', '"' + base + '/api/'],
-    ["`/api/${method}`", `\`${base}/api/\${method}\``],
-    // Backtick form of the same plugin-API family (`/api/pet`, ...).
-    ["`/api/", `\`${base}/api/`],
-    ['"/plugins/events"', '"' + base + '/plugins/events"'],
-    // Plugin client bundles fetch their own /plugins/<id>/... assets at runtime
-    // (e.g. a ticker widget); rewriteHtml already covers the HTML-side refs.
-    ['"/plugins/', '"' + base + '/plugins/'],
-    // dshmarket client bundle references its HTTP routes (`/dsh-market/*`,
-    // registry/installed/install/...) as root-absolute strings; prefix them
-    // so the browser hits them under the proxy base path.
-    ['"/dsh-market/', '"' + base + '/dsh-market/'],
-    // vision-toolkit exposes its HTTP routes under /_dsh/vision-toolkit/*.
-    ['"/_dsh/', '"' + base + '/_dsh/'],
-    ['"/manifest.webmanifest"', '"' + base + '/manifest.webmanifest"'],
-    ['"/favicon.svg"', '"' + base + '/favicon.svg"'],
-    ['"/api"', '"' + base + '/api"'],
-    ["`/api`", `\`${base}/api\``],
-    // Some bundles emit root-absolute routes with single quotes (vision-toolkit
-    // `/_dsh/...`, dsh-pet `/api/pet/pets`); the double-quoted rules above never
-    // match those, so a bare path would resolve against the host root and 404.
-    // Prefix each single-quoted form like its double-quoted twin.
-    ["'/api/events.host'", `'${base}/api/events.host'`],
-    ["'/api/events.mux'", `'${base}/api/events.mux'`],
-    ["'/api/respond'", `'${base}/api/respond'`],
-    ["'/api/", `'${base}/api/`],
-    ["'/plugins/events'", `'${base}/plugins/events'`],
-    ["'/plugins/", `'${base}/plugins/`],
-    ["'/dsh-market/", `'${base}/dsh-market/`],
-    ["'/_dsh/", `'${base}/_dsh/`],
-    ["'/manifest.webmanifest'", `'${base}/manifest.webmanifest'`],
-    ["'/favicon.svg'", `'${base}/favicon.svg'`],
-    ["'/api'", `'${base}/api'`],
-  ];
-  for (const [from, to] of rules) {
-    s = s.split(from).join(to);
-  }
+  // The base path rewrites `/api` (the RPC channel) to `/proxy/3100/api`,
+  // but connection's assertTarget rejects a channel with more than one slash
+  // (`CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/`). Widen the class to accept
+  // `/`, so the rewritten multi-segment channel passes validation while the
+  // URL built from it (`${channel}/${endpoint}`) still carries the base path.
+  s = s
+    .split("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~-]+$/")
+    .join("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~\\/-]+$/");
+  // Cover double-quoted, single-quoted and backtick forms uniformly (e.g.
+  // vision-toolkit emits '/_dsh/...' with single quotes, dsh-pet emits
+  // '/api/pet/pets' with single quotes, connection uses `/${method}`).
+  for (const q of ['"', "'", "`"]) s = prefixQuoted(s, base, q, JS_TARGETS);
   return s;
 }
 
+function needsRewrite(status, contentType) {
+  if (status !== 200 || !contentType) return false;
+  const type = contentType.toLowerCase();
+  return type.includes("text/html") || type.includes("javascript") || type.includes("application/manifest+json");
+}
+
+function rewriteBody(body, base, contentType) {
+  const type = contentType.toLowerCase();
+  if (type.includes("text/html") || type.includes("application/manifest+json")) return rewriteHtml(body, base);
+  return rewriteJs(body, base);
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
 function normalizePath(rawUrl) {
   let url = rawUrl;
-  if (url.startsWith(BASE)) url = url.slice(BASE.length);
+  if (BASE !== "/" && url.startsWith(BASE)) url = url.slice(BASE.length);
   // code-server's proxy target joins an extra slash, e.g. //api/events.mux.
   url = url.replace(/^\/+/, "/");
   if (url === "") url = "/";
   return url;
 }
 
-const LOOPBACK_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
-
-function headerHost(headers) {
+function requestHeaders(headers) {
   // dsh gates a whole class of privileged RPC methods (settings/credentials/
   // agentPreset/llm.discoverModels) to loopback-same-origin regardless of
   // trustedHosts — `trustedHosts` is a DNS-rebinding fence, not authentication.
@@ -158,13 +182,38 @@ function headerHost(headers) {
     out[k] = v;
   }
   out.host = LOOPBACK_AUTHORITY;
+  // Rewriting only makes sense on the plain bytes; never ask upstream for a
+  // compressed representation that would turn HTML/JS into binary gibberish.
+  out["accept-encoding"] = "identity";
   if (out.origin) out.origin = `http://${LOOPBACK_AUTHORITY}`;
   return out;
 }
 
+function responseHeaders(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (HOP_BY_HOP.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function sendUpstreamError(res, err) {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.writeHead(502, { "content-type": "text/plain" });
+  res.end(`dsh-codeserver-proxy: upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} unreachable: ${err.message}`);
+}
+
+// ---------------------------------------------------------------------------
+// Proxy handler
+// ---------------------------------------------------------------------------
+
 function forward(req, res) {
   const targetPath = normalizePath(req.url);
-  const headers = headerHost(req.headers);
+  const headers = requestHeaders(req.headers);
 
   const upstream = http.request(
     {
@@ -175,30 +224,40 @@ function forward(req, res) {
       headers,
     },
     (upRes) => {
-      const chunks = [];
-      upRes.on("data", (c) => chunks.push(c));
-      upRes.on("end", () => {
-        let body = Buffer.concat(chunks);
-        const type = upRes.headers["content-type"] || "";
-        let status = upRes.statusCode;
-        if (status === 200) {
-          if (type.includes("text/html")) body = Buffer.from(rewriteHtml(body.toString("utf8"), BASE));
-          else if (type.includes("javascript")) body = Buffer.from(rewriteJs(body.toString("utf8"), BASE));
-          else if (type.includes("application/manifest+json")) body = Buffer.from(rewriteHtml(body.toString("utf8"), BASE));
+      const status = upRes.statusCode;
+      const contentType = upRes.headers["content-type"] || "";
+
+      if (needsRewrite(status, contentType)) {
+        // Rewritable responses are buffered (they are HTML/JS text, not large
+        // binaries), rewritten, then sent with a recomputed content-length.
+        const chunks = [];
+        upRes.on("data", (c) => chunks.push(c));
+        upRes.on("end", () => {
+          if (res.destroyed) return;
+          const raw = Buffer.concat(chunks).toString("utf8");
+          const body = Buffer.from(rewriteBody(raw, BASE, contentType));
+          const outHeaders = responseHeaders(upRes.headers);
+          outHeaders["content-length"] = String(body.length);
+          res.writeHead(status, outHeaders);
+          res.end(body);
+        });
+        upRes.on("error", () => res.destroy());
+      } else {
+        // Everything else (assets, streams, SSE, 404s, redirects, ...) is
+        // piped through untouched, without buffering it in memory.
+        const outHeaders = responseHeaders(upRes.headers);
+        if (res.destroyed) {
+          upRes.destroy();
+          return;
         }
-        const outHeaders = { ...upRes.headers };
-        delete outHeaders["transfer-encoding"];
-        delete outHeaders["content-length"];
-        outHeaders["content-length"] = String(body.length);
         res.writeHead(status, outHeaders);
-        res.end(body);
-      });
+        upRes.pipe(res);
+        upRes.on("error", () => res.destroy());
+      }
     },
   );
-  upstream.on("error", (err) => {
-    res.writeHead(502, { "content-type": "text/plain" });
-    res.end(`dsh-codeserver-proxy: upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} unreachable: ${err.message}`);
-  });
+
+  upstream.on("error", (err) => sendUpstreamError(res, err));
   req.on("error", () => upstream.destroy());
   // Client can drop the response mid-flight (abort, RST); swallow so the
   // process never dies on an unhandled socket error.
@@ -213,7 +272,7 @@ server.on("clientError", (err, socket) => socket.destroy());
 // base-prefixed paths; pipe the upgraded socket to upstream.
 server.on("upgrade", (req, socket, head) => {
   const targetPath = normalizePath(req.url);
-  const headers = headerHost(req.headers);
+  const headers = requestHeaders(req.headers);
   const upstream = http.request({
     host: UPSTREAM_HOST,
     port: UPSTREAM_PORT,
@@ -224,6 +283,18 @@ server.on("upgrade", (req, socket, head) => {
   // without these listeners any dropped WS connection would crash the proxy.
   socket.on("error", () => socket.destroy());
   upstream.on("error", () => socket.destroy());
+  upstream.on("response", (upRes) => {
+    // Upstream refused the upgrade (e.g. 404/502). Pass a plain HTTP response
+    // back instead of leaving the browser connection hanging.
+    const statusLine = `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage || "Error"}\r\n`;
+    socket.write(statusLine);
+    for (const [k, v] of Object.entries(responseHeaders(upRes.headers))) {
+      socket.write(`${k}: ${v}\r\n`);
+    }
+    socket.write("\r\n");
+    upRes.on("error", () => socket.destroy());
+    upRes.pipe(socket);
+  });
   upstream.on("upgrade", (upRes, upSocket, upHead) => {
     upSocket.on("error", () => {
       socket.destroy();
@@ -244,6 +315,10 @@ server.on("upgrade", (req, socket, head) => {
   upstream.end();
 });
 
+// ---------------------------------------------------------------------------
+// Upstream readiness / dsh spawn
+// ---------------------------------------------------------------------------
+
 function upstreamReady() {
   return new Promise((resolve) => {
     const r = http.get({ host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: "/" }, (res) => {
@@ -258,6 +333,8 @@ function upstreamReady() {
   });
 }
 
+let dshChild = null;
+
 async function ensureUpstream() {
   if (!SPAWN_DSH) return;
   if (await upstreamReady()) return;
@@ -265,9 +342,11 @@ async function ensureUpstream() {
   const child = spawn("dsh", ["web", "--port", String(UPSTREAM_PORT)], {
     stdio: ["ignore", "pipe", "pipe"],
   });
+  dshChild = child;
   child.stdout.on("data", (d) => process.stdout.write(`[dsh] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[dsh] ${d}`));
   child.on("exit", (code) => {
+    if (dshChild === child) dshChild = null;
     if (code !== null && code !== 0) console.error(`[dsh-codeserver-proxy] dsh web exited with code ${code}`);
   });
   for (let i = 0; i < 30; i++) {
@@ -276,6 +355,24 @@ async function ensureUpstream() {
   }
   console.error("[dsh-codeserver-proxy] upstream did not become ready; continuing anyway");
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+function shutdown(signal) {
+  console.log(`[dsh-codeserver-proxy] ${signal} received, shutting down`);
+  server.close(() => process.exit(0));
+  if (dshChild && !dshChild.killed) dshChild.kill("SIGTERM");
+  // Fallback: never hang in a half-open state.
+  setTimeout(() => process.exit(1), 3000).unref();
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+// Do not leave a spawned `dsh web` orphaned if the proxy dies another way.
+process.on("exit", () => {
+  if (dshChild && !dshChild.killed) dshChild.kill("SIGTERM");
+});
 
 await ensureUpstream();
 server.listen(PORT, "0.0.0.0", () => {

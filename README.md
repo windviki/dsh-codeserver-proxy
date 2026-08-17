@@ -1,89 +1,93 @@
 # dsh-codeserver-proxy
 
-Base-path 适配代理：让 [dsh](https://github.com/deepseek-ai/dsh)（DeepSeek Harness）的官方 Web UI，能在**自部署的 code-server** 的端口转发下正常工作，浏览器里一点即达。
+**English** | [中文](README.zh-CN.md)
+
+Base-path adapter so the official [dsh](https://github.com/deepseek-ai/dsh) (DeepSeek Harness) web UI works behind a **self-hosted code-server**'s port forwarding — one click in the browser, no manual URL fixing.
 
 ```
-你的浏览器
+Your browser
    │  https://code.your-host/proxy/3100/
    ▼
-code-server  (端口转发: 把 /proxy/3100/ 转发到本机 127.0.0.1:3100)
+code-server  (port forwarding: /proxy/3100/ -> 127.0.0.1:3100 on the host)
    ▼
-dsh-codeserver-proxy   (本工程: 监听 3100, 转发 + 重写)
+dsh-codeserver-proxy   (this project: listens on 3100, forwards + rewrites)
    ▼
-dsh web                (官方 UI, 绑定 127.0.0.1:3000)
+dsh web                (official UI, bound to 127.0.0.1:3000)
 ```
 
-## 背景：为什么要这个代理
+## Why this proxy exists
 
-dsh 的 `dsh web` 是**本地优先**的 Web 服务：
+`dsh web` is a **local-first** web service:
 
-- 它只绑定 loopback（`127.0.0.1:3000`），默认只给本机浏览器用；
-- 它输出的前端资源全部是**根绝对路径**（`/assets/...`、`/api/...`、`/plugins/...`、`/dsh-market/...`）。
+- it only binds loopback (`127.0.0.1:3000`), intended for a local browser;
+- the frontend resources it serves are all **root-absolute paths** (`/assets/...`, `/api/...`, `/plugins/...`, `/dsh-market/...`).
 
-而 code-server 的端口转发把服务挂载在 `https://host/proxy/<port>/` 这个**子路径**下。于是浏览器打开转发地址后，页面里的 `/assets/...` 会被解析到 `https://host/assets/...`（主机根路径）而不是 `/proxy/<port>/assets/...`，整个 SPA 根本加载不出来。
+code-server's port forwarding mounts the service under a **sub-path** — `https://host/proxy/<port>/`. When the browser loads the forwarded address, those `/assets/...` references resolve to `https://host/assets/...` (the host root) instead of `/proxy/<port>/assets/...`, so the SPA never loads.
 
-本工程就是架在两者之间的适配器：**它转发一切到 dsh，同时把 dsh 吐出的 HTML/JS 里每个根绝对引用改写上 `/proxy/<port>/` 前缀**，让 UI 在 code-server 下开箱即用。除此之外，UI 的字节保持不变。
+This project is the adapter in between: **it forwards everything to dsh and rewrites every root-absolute reference in the HTML/JS served by dsh with a `/proxy/<port>/` prefix**, so the UI works out of the box under code-server. Apart from that, the UI bytes are untouched.
 
-## 它还解决的三件事
+## What else it fixes
 
-1. **权限栅栏**。dsh 把一整个特权 RPC 类别（设置 / 凭据 / agent 预设 / 模型发现）限定为 loopback 同源访问，`trustedHosts` 只是 DNS-rebinding 防线、不是认证。代理把每个请求的 `Host` 和 `Origin` 都改写成 loopback 上游的样子，等价于本机浏览器直连，特权功能在 code-server 下同样可用。
-2. **dsh-market 重启/下载守卫**。dsh-market 的进程控制端点拒绝任何带转发痕迹（`x-forwarded-*`）的请求。code-server 恰好会加这些头，代理把它们剥离，让「一键重启」在转发环境下也能用。
-3. **WebSocket 下行**。`/api/events.mux`、`/api/events.host` 等实时通道以同样的 base 前缀路径透传，101 升级头原样转发（`Sec-WebSocket-Accept` 必须来自上游，浏览器会校验）。
+1. **Privileged-RPC fence.** dsh restricts a whole class of privileged RPC methods (settings / credentials / agent presets / model discovery) to loopback same-origin access; `trustedHosts` is only a DNS-rebinding fence, not authentication. The proxy rewrites each request's `Host` and `Origin` to look like a direct local browser connection to the loopback upstream, so privileged features work under code-server as well.
+2. **dsh-market restart/download guards.** dsh-market's process-control endpoints reject any request that carries forwarding traces (`x-forwarded-*`). code-server adds exactly those headers; the proxy strips them so one-click restart works behind the forward.
+3. **WebSocket downlinks.** Real-time channels such as `/api/events.mux` and `/api/events.host` pass through with the same base-prefixed path; the `101` upgrade headers are forwarded verbatim (`Sec-WebSocket-Accept` must come from upstream — the browser verifies it).
 
-## 快速开始
+## Quick start
 
-前置要求：
+Prerequisites:
 
 - Node.js >= 18
-- 已安装 `dsh` CLI（本代理可以替你拉起 `dsh web`；或者你自己单独起好 dsh）
-- 一个自部署的 code-server，并配置好端口转发
+- the `dsh` CLI installed (the proxy can spawn `dsh web` for you; alternatively run dsh yourself)
+- a self-hosted code-server with port forwarding configured
 
-### 1. 配置
+### 1. Configure
 
 ```bash
 cp .env.example .env
-# 按需编辑 .env
+# edit .env if needed
 ```
 
-### 2. 启动
+### 2. Start
 
 ```bash
 node proxy.js
 ```
 
-代理默认监听 `3100`。若上游 `127.0.0.1:3000` 没有 dsh，它会自动 `spawn` 一个 `dsh web --port 3000`。
+The proxy listens on `3100` by default. If no dsh is reachable at `127.0.0.1:3000`, it automatically spawns `dsh web --port 3000`.
 
-### 3. 在 code-server 里开启端口转发
+### 3. Forward the port in code-server
 
-在 code-server 中把本机端口 `3100` 转发出去，转发地址形如：
+Forward host port `3100` in code-server. The forwarding address looks like:
 
 ```
 https://code.your-host/proxy/3100/
 ```
 
-浏览器打开这个地址即进入 dsh Web UI。
+Open that address in a browser to enter the dsh web UI.
 
-## 配置项
+## Configuration
 
-所有配置可通过环境变量或 `.env` 设置（`.env` 已 gitignore，请勿提交）。
+All settings can be provided via environment variables or a `.env` file (`.env` is gitignored — never commit it).
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `PROXY_BASE` | `/proxy/3100` | 代理在 code-server 下被访问的 base 路径，即端口转发挂载的子树 |
-| `PROXY_PORT` | `3100` | 代理自己监听的端口 |
-| `PROXY_UPSTREAM_HOST` | `127.0.0.1` | dsh web 所在主机 |
-| `PROXY_UPSTREAM_PORT` | `3000` | dsh web 端口 |
-| `PROXY_SPAWN_DSH` | `1` | 设为 `0` 时不自动拉起 dsh（例如 dsh 由 systemd/pm2 托管） |
+| `PROXY_BASE` | `/proxy/3100` | Base path under which the proxy is reached on code-server, i.e. the forwarded subtree |
+| `PROXY_PORT` | `3100` | Port the proxy itself listens on |
+| `PROXY_UPSTREAM_HOST` | `127.0.0.1` | Host where dsh web is running |
+| `PROXY_UPSTREAM_PORT` | `3000` | Port of dsh web |
+| `PROXY_SPAWN_DSH` | `1` | Set to `0` to disable auto-spawning dsh (e.g. when dsh is managed by systemd/pm2) |
 
-> 注意变量用 `PROXY_` 前缀而非 `DSH_`：dsh 启动时会把调用目录当作 cwd 读取 `.env`，而 `DSH_` 前缀是 dsh 保留的启动环境命名空间，出现在 `.env` 里会导致 dsh 拒绝启动。
+> The variables deliberately use the `PROXY_` prefix instead of `DSH_`: dsh boots with the calling directory as its cwd and reads `.env` from there, and `DSH_`-prefixed names are dsh's reserved bootstrap namespace — if any appear in `.env`, dsh refuses to start.
 
-## 工作原理
+## How it works
 
-- **改写 HTML/JS**：只在 `200` 响应且 `content-type` 为 HTML / JavaScript / Web App Manifest 时执行；把 `"/assets/`、`"/api`、`"/plugins/`、`"/dsh-market/` 等根绝对引用统一加上 base 前缀。base 插在开引号之后，保证改写后的字符串仍是合法 JSON/HTML。
-- **通道校验放宽**：dsh 连接层要求 RPC channel 是单段路径（`CHANNEL_PATTERN`），改写后的 `/proxy/<port>/api` 是多段，代理把该正则的字符类放宽以放行改写后的 channel，URL 仍携带 base 前缀。
-- **请求头**：`Host`/`Origin` 改写成 loopback 上游；剥离 `hop-by-hop` 头与 `x-forwarded-*` 转发痕迹。
-- **错误安全**：上游失联返回 `502`；客户端中途断连、WS 升级失败都不致代理进程崩溃。
+- **HTML/JS rewriting** is applied only to `200` responses with `content-type` of HTML, JavaScript or Web App Manifest. Root-absolute references (`/assets/`, `/api`, `/plugins/`, `/dsh-market/`, `/_dsh/`, manifest, favicon, …) are prefixed with the base path after the opening quote, in both double-quoted, single-quoted and backtick forms, so the rewritten string remains valid JSON/HTML/JS. More specific paths are rewritten before generic prefixes, so a path is never double-prefixed.
+- **Everything else streams through untouched** — binaries, SSE, redirects and error responses are piped without being buffered in memory.
+- **Channel-validation widening.** dsh's connection layer requires the RPC channel to be a single path segment (`CHANNEL_PATTERN`); after rewriting, `/proxy/<port>/api` is multi-segment. The proxy widens that regex character class to accept `/`, so the rewritten channel passes validation while the URL still carries the base prefix.
+- **Request headers.** `Host`/`Origin` are rewritten to the loopback upstream; hop-by-hop headers and `x-forwarded-*` forwarding traces are stripped.
+- **Error safety.** An unreachable upstream returns `502`; client disconnects, RSTs and failed WS upgrades are handled without crashing the process.
+- **Graceful shutdown.** `SIGINT`/`SIGTERM` close the listener and terminate a spawned `dsh web`, so no orphan process is left behind.
 
-## 许可
+## License
 
 MIT
