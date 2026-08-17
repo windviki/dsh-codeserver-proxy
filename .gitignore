@@ -1,0 +1,8 @@
+# Private per-deployment configuration. Never commit.
+.env
+
+# Runtime logs
+*.log
+
+# Dependencies
+node_modules/

@@ -1,13 +1,16 @@
 {
-  "name": "dsh-web-proxy",
+  "name": "dsh-codeserver-proxy",
   "version": "0.1.0",
-  "private": true,
-  "description": "Base-path adapter so the official dsh web UI works behind code-server /proxy/<port>/ port forwarding.",
+  "description": "Base-path adapter so the official dsh (DeepSeek Harness) web UI works behind a self-hosted code-server's /proxy/<port>/ port forwarding.",
   "type": "module",
   "bin": {
-    "dsh-web-proxy": "proxy.js"
+    "dsh-codeserver-proxy": "proxy.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "node proxy.js"
   }
 }

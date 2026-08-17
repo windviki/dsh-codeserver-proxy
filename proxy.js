@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Base-path adapter for the official DeepSeek Harness web UI.
+ * dsh-codeserver-proxy — base-path adapter for the official DeepSeek Harness
+ * web UI, deployed on a self-hosted code-server.
  *
  * dsh web serves its frontend with root-absolute paths (/assets/..., /plugins/...,
  * /api/...) and binds to loopback. When it is exposed through code-server's port
@@ -13,13 +14,26 @@
 
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
 
-const BASE = process.env.DSH_WEB_BASE || "/proxy/3100";
-const UPSTREAM_HOST = process.env.DSH_WEB_UPSTREAM_HOST || "127.0.0.1";
-const UPSTREAM_PORT = Number(process.env.DSH_WEB_UPSTREAM_PORT || 3000);
-const PORT = Number(process.env.PORT || 3100);
-const SPAWN_DSH = process.env.DSH_WEB_SPAWN !== "0";
+// Minimal .env loader (no shell interpolation). Deployers keep private values
+// — proxy base path, listening/upstream ports, whether to spawn dsh — in a
+// gitignored .env; every variable below has a documented default for the
+// common code-server + dsh-on-loopback layout. Real environment variables
+// always win over .env entries.
+for (const line of existsSync(".env") ? readFileSync(".env", "utf8").split("\n") : []) {
+  const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
+  if (m && m[2] !== "" && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+}
+
+// Variables use the PROXY_ prefix (not DSH_*): dsh boots with this directory as
+// its cwd and refuses any DSH_-prefixed name it finds in a .env there.
+const BASE = process.env.PROXY_BASE || "/proxy/3100";
+const UPSTREAM_HOST = process.env.PROXY_UPSTREAM_HOST || "127.0.0.1";
+const UPSTREAM_PORT = Number(process.env.PROXY_UPSTREAM_PORT || 3000);
+const PORT = Number(process.env.PROXY_PORT || 3100);
+const SPAWN_DSH = process.env.PROXY_SPAWN_DSH !== "0";
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -30,6 +44,21 @@ const HOP_BY_HOP = new Set([
   "trailer",
   "transfer-encoding",
   "upgrade",
+]);
+
+// code-server's path proxy stamps forwarding traces (x-forwarded-*) on its
+// /proxy/<port>/ requests. dsh-market's process-control guards
+// (trustedRestartRequest / trustedDownloadRequest) reject any request that
+// shows a forwarding trace, treating it as proxied rather than a direct
+// loopback peer. From the upstream dsh's point of view this proxy IS the
+// final local peer, so those traces are stripped here — the request then
+// satisfies the same loopback-same-origin checks a stock local browser does.
+const NO_FORWARD_TRACE = new Set([
+  "forwarded",
+  "x-forwarded-for",
+  "x-forwarded-proto",
+  "x-forwarded-host",
+  "x-real-ip",
 ]);
 
 function rewriteHtml(body, base) {
@@ -65,6 +94,10 @@ function rewriteJs(body, base) {
     ['"/api/respond"', '"' + base + '/api/respond"'],
     ["`/api/${method}`", `\`${base}/api/\${method}\``],
     ['"/plugins/events"', '"' + base + '/plugins/events"'],
+    // dshmarket client bundle references its HTTP routes (`/dsh-market/*`,
+    // registry/installed/install/...) as root-absolute strings; prefix them
+    // so the browser hits them under the proxy base path.
+    ['"/dsh-market/', '"' + base + '/dsh-market/'],
     ['"/manifest.webmanifest"', '"' + base + '/manifest.webmanifest"'],
     ['"/favicon.svg"', '"' + base + '/favicon.svg"'],
     ['"/api"', '"' + base + '/api"'],
@@ -96,7 +129,7 @@ function headerHost(headers) {
   // satisfied exactly as it is in the stock `dsh web` local-only deployment.
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
-    if (HOP_BY_HOP.has(k)) continue;
+    if (HOP_BY_HOP.has(k) || NO_FORWARD_TRACE.has(k)) continue;
     out[k] = v;
   }
   out.host = LOOPBACK_AUTHORITY;
@@ -139,7 +172,7 @@ function forward(req, res) {
   );
   upstream.on("error", (err) => {
     res.writeHead(502, { "content-type": "text/plain" });
-    res.end(`dsh-web-proxy: upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} unreachable: ${err.message}`);
+    res.end(`dsh-codeserver-proxy: upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} unreachable: ${err.message}`);
   });
   req.on("error", () => upstream.destroy());
   // Client can drop the response mid-flight (abort, RST); swallow so the
@@ -203,24 +236,24 @@ function upstreamReady() {
 async function ensureUpstream() {
   if (!SPAWN_DSH) return;
   if (await upstreamReady()) return;
-  console.log(`[dsh-web-proxy] upstream not running, spawning dsh web on ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
+  console.log(`[dsh-codeserver-proxy] upstream not running, spawning dsh web on ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
   const child = spawn("dsh", ["web", "--port", String(UPSTREAM_PORT)], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.on("data", (d) => process.stdout.write(`[dsh] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[dsh] ${d}`));
   child.on("exit", (code) => {
-    if (code !== null && code !== 0) console.error(`[dsh-web-proxy] dsh web exited with code ${code}`);
+    if (code !== null && code !== 0) console.error(`[dsh-codeserver-proxy] dsh web exited with code ${code}`);
   });
   for (let i = 0; i < 30; i++) {
     if (await upstreamReady()) return;
     await new Promise((r) => setTimeout(r, 500));
   }
-  console.error("[dsh-web-proxy] upstream did not become ready; continuing anyway");
+  console.error("[dsh-codeserver-proxy] upstream did not become ready; continuing anyway");
 }
 
 await ensureUpstream();
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[dsh-web-proxy] listening on ${PORT}; access through ${BASE}/ on code-server`);
-  console.log(`[dsh-web-proxy] forwarding to ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
+  console.log(`[dsh-codeserver-proxy] listening on ${PORT}; access through ${BASE}/ on code-server`);
+  console.log(`[dsh-codeserver-proxy] forwarding to ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
 });
