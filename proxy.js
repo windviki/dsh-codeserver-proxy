@@ -79,17 +79,28 @@ function normalizePath(rawUrl) {
   return url;
 }
 
+const LOOPBACK_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
+
+function headerHost(headers) {
+  // dsh gates a whole class of privileged RPC methods (settings/credentials/
+  // agentPreset/llm.discoverModels) to loopback-same-origin regardless of
+  // trustedHosts — `trustedHosts` is a DNS-rebinding fence, not authentication.
+  // So every request is rewritten to look like a local browser direct-connect:
+  // Host and Origin both become the loopback upstream, and the fence is then
+  // satisfied exactly as it is in the stock `dsh web` local-only deployment.
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (HOP_BY_HOP.has(k)) continue;
+    out[k] = v;
+  }
+  out.host = LOOPBACK_AUTHORITY;
+  if (out.origin) out.origin = `http://${LOOPBACK_AUTHORITY}`;
+  return out;
+}
+
 function forward(req, res) {
   const targetPath = normalizePath(req.url);
-  const headers = {};
-  // Preserve the original Host header: dsh's /api fence compares Host against
-  // the browser's Origin, and the profile trusts the external authority
-  // (code.example.com) via trustedHosts. Rewriting Host to the loopback target
-  // would make the two mismatch and the fence would reject every request.
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (HOP_BY_HOP.has(k)) continue;
-    headers[k] = v;
-  }
+  const headers = headerHost(req.headers);
 
   const upstream = http.request(
     {
@@ -125,31 +136,35 @@ function forward(req, res) {
     res.end(`dsh-web-proxy: upstream ${UPSTREAM_HOST}:${UPSTREAM_PORT} unreachable: ${err.message}`);
   });
   req.on("error", () => upstream.destroy());
+  // Client can drop the response mid-flight (abort, RST); swallow so the
+  // process never dies on an unhandled socket error.
+  res.on("error", () => upstream.destroy());
   req.pipe(upstream);
 }
 
 const server = http.createServer(forward);
+server.on("clientError", (err, socket) => socket.destroy());
 
 // WebSocket downlinks (/api/events.mux, /api/events.host) pass through the same
 // base-prefixed paths; pipe the upgraded socket to upstream.
 server.on("upgrade", (req, socket, head) => {
   const targetPath = normalizePath(req.url);
-  const headers = {};
-  // Keep the original Host header, same rationale as forward(): dsh's /api fence
-  // (and the WS handshake) compares Host against the browser's Origin, and the
-  // profile trusts code.example.com via trustedHosts. Rewriting it to loopback
-  // would make Host != Origin and the fence would reject the upgrade.
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (HOP_BY_HOP.has(k)) continue;
-    headers[k] = v;
-  }
+  const headers = headerHost(req.headers);
   const upstream = http.request({
     host: UPSTREAM_HOST,
     port: UPSTREAM_PORT,
     path: targetPath,
     headers: { ...headers, connection: "Upgrade", upgrade: "websocket" },
   });
+  // Raw upgraded sockets emit 'error' (RST/abort) with no automatic handler;
+  // without these listeners any dropped WS connection would crash the proxy.
+  socket.on("error", () => socket.destroy());
+  upstream.on("error", () => socket.destroy());
   upstream.on("upgrade", (upRes, upSocket, upHead) => {
+    upSocket.on("error", () => {
+      socket.destroy();
+      upSocket.destroy();
+    });
     // Forward the upstream 101 headers verbatim: the browser WebSocket verifies
     // Sec-WebSocket-Accept (SHA-1 of key+GUID), so a hardcoded 101 would fail.
     socket.write("HTTP/1.1 101 Switching Protocols\r\n");
@@ -162,7 +177,6 @@ server.on("upgrade", (req, socket, head) => {
     if (upHead.length) socket.write(upHead);
     socket.pipe(upSocket).pipe(socket);
   });
-  upstream.on("error", () => socket.destroy());
   upstream.end();
 });
 
