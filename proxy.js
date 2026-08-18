@@ -107,6 +107,15 @@ const JS_TARGETS = [
   "/plugins/",
   "/dsh-market/",
   "/_dsh/",
+  // Third-party plugin root-absolute API prefixes. `@linxin666/*` plugins
+  // fetch these directly (post()/EventSource); without the rewrite the
+  // browser resolves them against the code-server host root and the calls
+  // never reach dsh. `/describe` also covers `/describe-image/` since
+  // prefixQuoted splits on the leading `/describe` substring.
+  "/aionui-panel/",
+  "/git/",
+  "/describe",
+  "/mutate",
   "/manifest.webmanifest",
   "/favicon.svg",
   "/api",
