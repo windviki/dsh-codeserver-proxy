@@ -137,6 +137,37 @@ function prefixQuoted(s, base, quote, targets) {
   return out;
 }
 
+// Root path segments that are local filesystem/system roots, never plugin API
+// keys: a `/key/…` literal under one of these must stay untouched.
+const FS_ROOT_SEGMENTS = new Set([
+  "home", "root", "Users", "dev", "bin", "sbin", "usr", "etc", "var", "tmp",
+  "proc", "sys", "opt", "lib", "lib64", "boot", "media", "mnt", "run", "srv",
+  "System", "Library", "Applications", "private", "Volumes", "Network",
+]);
+
+// Fallback rewrite for plugins not yet in JS_TARGETS: any root-absolute
+// `"/<key>/…"` literal left after the whitelist pass whose first segment looks
+// like a plugin key (a short alnum/dot/underscore/hyphen token that is not a
+// filesystem root, not `proxy` — the base path — and not an already-whitelisted
+// key) gets base-prefixed too. Newly added plugins therefore work without
+// editing the whitelist. Heuristic by design:
+// - Only double/single-quoted literals are considered. Backtick templates are
+//   left to the whitelist (dsh-better-sidebar's `/sidebar/bundle/${name}.js`
+//   chunk loader and `/sidebar/ws/*` are the known backtick forms; scanning
+//   backticks generically hits minified non-URL encodings — CodeMirror's parser
+//   payloads in client-editor.js look like `/nQ/…`, `/U/…` — so they must not
+//   be rewritten).
+// - Only the quote that opens the literal is considered, so nested paths inside
+//   an already-prefixed string can never be re-prefixed, and fs paths (/home,
+//   /tmp, /dev, …) are never touched.
+function pluginFallbackPrefix(s, base, quote) {
+  return s.replace(
+    new RegExp(quote + "\\/([A-Za-z0-9][A-Za-z0-9._-]*)\\/", "g"),
+    (whole, seg) =>
+      FS_ROOT_SEGMENTS.has(seg) || seg === "proxy" ? whole : quote + base + "/" + seg + "/",
+  );
+}
+
 function rewriteHtml(body, base) {
   if (base === "/") return body;
   return prefixQuoted(body, base, '"', HTML_TARGETS);
@@ -157,6 +188,9 @@ function rewriteJs(body, base) {
   // vision-toolkit emits '/_dsh/...' with single quotes, dsh-pet emits
   // '/api/pet/pets' with single quotes, connection uses `/${method}`).
   for (const q of ['"', "'", "`"]) s = prefixQuoted(s, base, q, JS_TARGETS);
+  // Rescue unknown plugin keys not in JS_TARGETS (whitelist stays first).
+  // Double/single quotes only — backtick templates are the whitelist's job.
+  for (const q of ['"', "'"]) s = pluginFallbackPrefix(s, base, q);
   return s;
 }
 
