@@ -116,6 +116,13 @@ const JS_TARGETS = [
   "/git/",
   "/describe",
   "/mutate",
+  // `dsh-better-sidebar` serves its whole surface under /sidebar/:
+  // POST `/sidebar/api/<method>` (fs.tree/git.status/…), lazy chunk scripts
+  // `/sidebar/bundle/<name>.js`, `/sidebar/file?…` media, `/sidebar/ws/*`
+  // terminals and `/sidebar/html/*` previews — all root-absolute, so without
+  // the rewrite the browser resolves them against the code-server host root
+  // (chunks 404, API POSTs 405).
+  "/sidebar/",
   "/manifest.webmanifest",
   "/favicon.svg",
   "/api",

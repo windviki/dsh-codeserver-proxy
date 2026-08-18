@@ -4,5 +4,8 @@
 # Runtime logs
 *.log
 
+# Service control script pid file
+.service.pid
+
 # Dependencies
 node_modules/
