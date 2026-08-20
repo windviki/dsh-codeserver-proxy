@@ -277,6 +277,27 @@ function forward(req, res) {
       const status = upRes.statusCode;
       const contentType = upRes.headers["content-type"] || "";
 
+      // dsh's only source of 405 is the static-files fallback rejecting a
+      // non-GET/HEAD request no registered route claims — during start-up the
+      // RPC channel `/api` is not registered yet, so POST /api/* answers 405.
+      // The frontend treats that as a real Method Not Allowed and never
+      // retries. Report a transient 503 (with retry-after) instead and keep
+      // the readiness probe spinning; once dsh finishes booting the next
+      // request succeeds. A 405 on a live channel is anomalous and passes
+      // through untouched.
+      if (status === 405 && req.method === "POST" && targetPath.startsWith("/api")) {
+        upRes.resume();
+        ensureRpcProbe();
+        if (!rpcReady) {
+          res.writeHead(503, {
+            "content-type": "text/plain; charset=utf-8",
+            "retry-after": "2",
+          });
+          res.end("dsh-codeserver-proxy: dsh web is still starting up; refresh in a moment");
+          return;
+        }
+      }
+
       if (needsRewrite(status, contentType)) {
         // Rewritable responses are buffered (they are HTML/JS text, not large
         // binaries), rewritten, then sent with a recomputed content-length.
@@ -383,11 +404,89 @@ function upstreamReady() {
   });
 }
 
+// dsh web's HTTP server is up (and its static-files fallback is registered)
+// before its RPC channel `/api` is: the webserver listens early, then plugins
+// register routes as they boot. A POST /api/* that lands in that window hits
+// the fallback, which answers 405 (method not allowed) — the frontend treats
+// that as a real error and never retries, so the whole session list / history
+// / providers UI breaks during start-up. The readiness probe below watches the
+// RPC channel directly (host.describe answers 200 once the channel + apiProxy
+// are live) so the proxy can tell "dsh is still booting" from "dsh is broken".
+let rpcReady = false;
+let rpcProbeScheduled = false;
+
+function probeRpcOnce() {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      type: "client-request",
+      rpcId: "dsh-codeserver-proxy:probe",
+      method: "host.describe",
+      payload: {},
+    });
+    const probe = http.request(
+      {
+        host: UPSTREAM_HOST,
+        port: UPSTREAM_PORT,
+        path: "/api/host.describe",
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (probeRes) => {
+        probeRes.resume();
+        resolve(probeRes.statusCode === 200);
+      },
+    );
+    probe.on("error", () => resolve(false));
+    probe.setTimeout(1500, () => {
+      probe.destroy();
+      resolve(false);
+    });
+    probe.end(body);
+  });
+}
+
+// Probe until the channel is live, re-scheduling itself once a second while
+// dsh is still booting; idles (rpcReady stays true) once ready.
+async function ensureRpcProbe() {
+  if (rpcReady || rpcProbeScheduled) return;
+  rpcProbeScheduled = true;
+  try {
+    if (await probeRpcOnce()) {
+      rpcReady = true;
+      return;
+    }
+  } finally {
+    rpcProbeScheduled = false;
+  }
+  setTimeout(() => ensureRpcProbe(), 1000);
+}
+
+async function waitForRpcReady(timeoutMs = 60000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await probeRpcOnce()) {
+      rpcReady = true;
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  console.error("[dsh-codeserver-proxy] RPC channel did not become ready; continuing anyway");
+  return false;
+}
+
 let dshChild = null;
 
 async function ensureUpstream() {
   if (!SPAWN_DSH) return;
-  if (await upstreamReady()) return;
+  if (await upstreamReady()) {
+    // Port is up but the RPC channel may not be registered yet; wait for it so
+    // the first browser requests don't hit the static-files fallback (405).
+    await waitForRpcReady();
+    return;
+  }
   console.log(`[dsh-codeserver-proxy] upstream not running, spawning dsh web on ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
   const child = spawn("dsh", ["web", "--port", String(UPSTREAM_PORT)], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -400,7 +499,10 @@ async function ensureUpstream() {
     if (code !== null && code !== 0) console.error(`[dsh-codeserver-proxy] dsh web exited with code ${code}`);
   });
   for (let i = 0; i < 30; i++) {
-    if (await upstreamReady()) return;
+    if (await upstreamReady()) {
+      await waitForRpcReady();
+      return;
+    }
     await new Promise((r) => setTimeout(r, 500));
   }
   console.error("[dsh-codeserver-proxy] upstream did not become ready; continuing anyway");
