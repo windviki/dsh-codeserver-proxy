@@ -194,8 +194,17 @@ function rewriteJs(body, base) {
   return s;
 }
 
-function needsRewrite(status, contentType) {
+function needsRewrite(status, contentType, pathname = "") {
   if (status !== 200 || !contentType) return false;
+  // dsh-remote-web-ui's remote channel patches window.fetch/WebSocket/… and
+  // decides what to reroute from prefix constants baked into its client
+  // (API_PREFIX = "/api/", WS_PATHS, SIDEBAR_PREFIX, …). The base-path rewrite
+  // would turn those detectors into "/proxy/3100/api/…", so the channel then
+  // misroutes every already-prefixed SDK call to /remote/proxy/3100/api/…,
+  // which the code-server hop rejects with 405 before it ever reaches dsh.
+  // Serving this client byte-for-byte keeps the detectors correct; every real
+  // request URL in the main bundles is still rewritten as before.
+  if (pathname.startsWith("/plugins/@linxin666/dsh-remote-web-ui/client.js")) return false;
   const type = contentType.toLowerCase();
   return type.includes("text/html") || type.includes("javascript") || type.includes("application/manifest+json");
 }
@@ -298,7 +307,7 @@ function forward(req, res) {
         }
       }
 
-      if (needsRewrite(status, contentType)) {
+      if (needsRewrite(status, contentType, targetPath)) {
         // Rewritable responses are buffered (they are HTML/JS text, not large
         // binaries), rewritten, then sent with a recomputed content-length.
         const chunks = [];

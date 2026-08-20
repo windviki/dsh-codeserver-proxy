@@ -19,6 +19,12 @@ import { fileURLToPath } from "node:url";
 const PROXY_JS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "proxy.js");
 const PROBE_METHOD = "host.describe";
 
+// Served byte-for-byte for the dsh-remote-web-ui client (its remote channel
+// patches window.fetch and routes /api/* through /remote/...; rewriting its
+// API_PREFIX detector would misfire on the base-prefixed SDK calls) and used as
+// an ordinary script elsewhere, where the base-path rewrite must still apply.
+const FAKE_RWUI = 'const API_PREFIX = "/api/";\nconst REMOTE_PREFIX = "/remote";\n';
+
 function freePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -53,9 +59,19 @@ class StubUpstream {
       const url = new URL(req.url ?? "/", "http://x");
       this.seen.headers.push({ host: req.headers.host, origin: req.headers.origin, method: req.method });
       this.seen.paths.push(url.pathname);
+      if (url.pathname === "/assets/plugin.js") {
+        res.writeHead(200, { "content-type": "application/javascript" });
+        res.end(FAKE_RWUI);
+        return;
+      }
       if (url.pathname.startsWith("/assets/")) {
         res.writeHead(200, { "content-type": "application/javascript" });
         res.end("/* stub */");
+        return;
+      }
+      if (url.pathname === "/plugins/@linxin666/dsh-remote-web-ui/client.js") {
+        res.writeHead(200, { "content-type": "application/javascript" });
+        res.end(FAKE_RWUI);
         return;
       }
       if (req.method === "POST" && url.pathname.startsWith("/api/")) {
@@ -114,6 +130,17 @@ function fetchStatus(port, pathname, { method = "POST" } = {}) {
     );
     req.on("error", reject);
     req.end(method === "POST" ? body : undefined);
+  });
+}
+
+function fetchRaw(port, pathname) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ host: "127.0.0.1", port, path: pathname }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on("error", reject);
   });
 }
 
@@ -203,5 +230,19 @@ describe("proxy.js RPC-readiness guard", () => {
   test("转发给上游的请求被重写为 loopback Host 与 Origin", () => {
     const seen = stub.seen.headers.find((h) => h.method === "POST" && h.host === "127.0.0.1:" + stubPort);
     assert.ok(seen, "应有 POST 请求以 loopback Host 到达上游, 实际: " + JSON.stringify(stub.seen.headers.slice(-3)));
+  });
+
+  test("dsh-remote-web-ui 客户端原样透传, 检测常量不被 base 重写", async () => {
+    const r = await fetchRaw(proxyPort, "/proxy/" + proxyPort + "/plugins/@linxin666/dsh-remote-web-ui/client.js");
+    assert.equal(r.status, 200);
+    assert.match(r.body, /API_PREFIX = "\/api\/"/, "API_PREFIX 应保持 /api/ 原样");
+    assert.doesNotMatch(r.body, /\/proxy\/\d+\/api\//, "不应被加上 base 前缀");
+  });
+
+  test("普通插件脚本仍被 base 重写", async () => {
+    const r = await fetchRaw(proxyPort, "/proxy/" + proxyPort + "/assets/plugin.js");
+    assert.equal(r.status, 200);
+    assert.match(r.body, /API_PREFIX = "\/proxy\/\d+\/api\/"/, "普通脚本的 /api/ 应被 base 前缀化");
+    assert.doesNotMatch(r.body, /API_PREFIX = "\/api\/"/, "不应保持原样");
   });
 });
