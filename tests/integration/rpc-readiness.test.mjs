@@ -25,6 +25,14 @@ const PROBE_METHOD = "host.describe";
 // an ordinary script elsewhere, where the base-path rewrite must still apply.
 const FAKE_RWUI = 'const API_PREFIX = "/api/";\nconst REMOTE_PREFIX = "/remote";\n';
 
+// dsh-web-ui-settings builds its settings-bridge URL as
+// WEB_UI_SETTINGS_BRIDGE_PREFIX + path; `/describe`/`/mutate` are path
+// segments, so a bare `/describe` rewrite target would double-prefix them.
+const FAKE_BRIDGE = 'const P = "/api/dsh-web-ui-settings";\nconst post = (p) => fetch(P + p);\npost("/describe"); post("/mutate");\n';
+
+// dsh-tool-describe-image fetches root-absolute /describe-image/* endpoints.
+const FAKE_DESC_IMG = 'const E = "/describe-image/attach";\n';
+
 function freePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -72,6 +80,16 @@ class StubUpstream {
       if (url.pathname === "/plugins/@linxin666/dsh-remote-web-ui/client.js") {
         res.writeHead(200, { "content-type": "application/javascript" });
         res.end(FAKE_RWUI);
+        return;
+      }
+      if (url.pathname === "/plugins/@linxin666/dsh-client-ui-web-ui-settings/client.js") {
+        res.writeHead(200, { "content-type": "application/javascript" });
+        res.end(FAKE_BRIDGE);
+        return;
+      }
+      if (url.pathname === "/plugins/@linxin666/dsh-tool-describe-image/client.js") {
+        res.writeHead(200, { "content-type": "application/javascript" });
+        res.end(FAKE_DESC_IMG);
         return;
       }
       if (req.method === "POST" && url.pathname.startsWith("/api/")) {
@@ -244,5 +262,21 @@ describe("proxy.js RPC-readiness guard", () => {
     assert.equal(r.status, 200);
     assert.match(r.body, /API_PREFIX = "\/proxy\/\d+\/api\/"/, "普通脚本的 /api/ 应被 base 前缀化");
     assert.doesNotMatch(r.body, /API_PREFIX = "\/api\/"/, "不应保持原样");
+  });
+
+  test("settings 桥的 /describe /mutate 拼接参数不被双重 base 前缀", async () => {
+    const r = await fetchRaw(proxyPort, "/proxy/" + proxyPort + "/plugins/@linxin666/dsh-client-ui-web-ui-settings/client.js");
+    assert.equal(r.status, 200);
+    assert.match(r.body, /P = "\/proxy\/\d+\/api\/dsh-web-ui-settings"/, "桥前缀应被 base 前缀化");
+    assert.match(r.body, /post\("\/describe"\)/, "path 参数 /describe 应保持原样");
+    assert.match(r.body, /post\("\/mutate"\)/, "path 参数 /mutate 应保持原样");
+    assert.doesNotMatch(r.body, /\/proxy\/\d+\/describe/, "不应出现裸 /describe 被 base 前缀化");
+    assert.doesNotMatch(r.body, /\/proxy\/\d+\/mutate/, "不应出现裸 /mutate 被 base 前缀化");
+  });
+
+  test("describe-image 的 /describe-image/* 端点仍被 base 前缀", async () => {
+    const r = await fetchRaw(proxyPort, "/proxy/" + proxyPort + "/plugins/@linxin666/dsh-tool-describe-image/client.js");
+    assert.equal(r.status, 200);
+    assert.match(r.body, /E = "\/proxy\/\d+\/describe-image\/attach"/, "/describe-image/attach 应被 base 前缀化");
   });
 });

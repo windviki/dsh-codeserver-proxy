@@ -110,12 +110,14 @@ const JS_TARGETS = [
   // Third-party plugin root-absolute API prefixes. `@linxin666/*` plugins
   // fetch these directly (post()/EventSource); without the rewrite the
   // browser resolves them against the code-server host root and the calls
-  // never reach dsh. `/describe` also covers `/describe-image/` since
-  // prefixQuoted splits on the leading `/describe` substring.
+  // never reach dsh. Use the specific `/describe-image/` prefix, never bare
+  // `/describe`: dsh-web-ui-settings builds its settings-bridge URLs as
+  // WEB_UI_SETTINGS_BRIDGE_PREFIX + path where path is `"/describe"` /
+  // `"/mutate"`, so a bare `/describe` target would double-prefix them into
+  // /proxy/3100/api/dsh-web-ui-settings/proxy/3100/describe → 404.
   "/aionui-panel/",
   "/git/",
-  "/describe",
-  "/mutate",
+  "/describe-image/",
   // `dsh-better-sidebar` serves its whole surface under /sidebar/:
   // POST `/sidebar/api/<method>` (fs.tree/git.status/…), lazy chunk scripts
   // `/sidebar/bundle/<name>.js`, `/sidebar/file?…` media, `/sidebar/ws/*`
