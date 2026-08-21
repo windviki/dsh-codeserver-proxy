@@ -186,6 +186,17 @@ function rewriteJs(body, base) {
   s = s
     .split("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~-]+$/")
     .join("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~\\/-]+$/");
+  // dsh-client-connection derives connection.isLoopback from the browser's
+  // location.hostname. Through code-server that hostname is never loopback, so
+  // ui-settings switches its shared settings mirror to "memory" persistence and
+  // never reads the host — the Models page then fails to load its provider
+  // catalog with "settings are unavailable in this browser". The proxy already
+  // rewrites Host/Origin to the loopback upstream so the server-side fence
+  // passes; force the client flag true to match, so the settings RPCs are
+  // actually issued (and flow through the same loopback-looking path).
+  s = s
+    .split("isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),")
+    .join("isLoopback: true,");
   // Cover double-quoted, single-quoted and backtick forms uniformly (e.g.
   // vision-toolkit emits '/_dsh/...' with single quotes, dsh-pet emits
   // '/api/pet/pets' with single quotes, connection uses `/${method}`).

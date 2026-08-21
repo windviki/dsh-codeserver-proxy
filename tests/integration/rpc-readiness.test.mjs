@@ -33,6 +33,12 @@ const FAKE_BRIDGE = 'const P = "/api/dsh-web-ui-settings";\nconst post = (p) => 
 // dsh-tool-describe-image fetches root-absolute /describe-image/* endpoints.
 const FAKE_DESC_IMG = 'const E = "/describe-image/attach";\n';
 
+// dsh-client-connection derives connection.isLoopback from window.location.
+// Through code-server the hostname is never loopback, which would push the
+// settings mirror into "memory" persistence ("settings are unavailable in this
+// browser" on the Models page); the proxy must force the flag true.
+const FAKE_CONN = 'const handle = {\n  isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),\n  other: 1\n};\n';
+
 function freePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -90,6 +96,11 @@ class StubUpstream {
       if (url.pathname === "/plugins/@linxin666/dsh-tool-describe-image/client.js") {
         res.writeHead(200, { "content-type": "application/javascript" });
         res.end(FAKE_DESC_IMG);
+        return;
+      }
+      if (url.pathname === "/plugins/@deepseek-ai/dsh-client-connection/client.js") {
+        res.writeHead(200, { "content-type": "application/javascript" });
+        res.end(FAKE_CONN);
         return;
       }
       if (req.method === "POST" && url.pathname.startsWith("/api/")) {
@@ -278,5 +289,12 @@ describe("proxy.js RPC-readiness guard", () => {
     const r = await fetchRaw(proxyPort, "/proxy/" + proxyPort + "/plugins/@linxin666/dsh-tool-describe-image/client.js");
     assert.equal(r.status, 200);
     assert.match(r.body, /E = "\/proxy\/\d+\/describe-image\/attach"/, "/describe-image/attach 应被 base 前缀化");
+  });
+
+  test("connection 客户端的 isLoopback 被强制为 true", async () => {
+    const r = await fetchRaw(proxyPort, "/proxy/" + proxyPort + "/plugins/@deepseek-ai/dsh-client-connection/client.js");
+    assert.equal(r.status, 200);
+    assert.match(r.body, /isLoopback: true/, "isLoopback 应被强制为 true");
+    assert.doesNotMatch(r.body, /isLoopbackHostname\(pageLocation\.hostname\)/, "hostname 判定应被移除");
   });
 });
