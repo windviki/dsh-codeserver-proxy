@@ -49,7 +49,7 @@ start() {
     info "启动 proxy（端口 $PROXY_PORT）…"
     nohup node "$SCRIPT_DIR/proxy.js" >>"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
-    for _ in {1..20}; do
+    for _ in {1..90}; do
       is_up "$PROXY_PORT" && break
       sleep 0.5
     done

@@ -95,13 +95,17 @@ const NO_FORWARD_TRACE = new Set([
 // Response rewriting
 // ---------------------------------------------------------------------------
 // Order matters: a more specific path must be rewritten before a generic
-// prefix of it (e.g. /api/events.host before /api/, and /api itself last), so
+// prefix of it (e.g. /api/remote.mux before /api/, and /api itself last), so
 // a generic rule never runs first and produces a double-prefixed string.
 const HTML_TARGETS = ["/assets/", "/plugins/", "/manifest.webmanifest", "/favicon.svg"];
+// NOTE: never add "/api/" (or /sidebar/, /git/, /pet/) to HTML_TARGETS: dsh
+// 0.1.2's index.html inlines a parse-time remote-channel boot patch whose
+// detector table uses those exact root-absolute strings. The patch only
+// reroutes paths that literally start with them; every request the base-path
+// rewrite produces carries the /proxy/<port>/ prefix and therefore never
+// matches, which keeps the patch correctly inert under code-server.
 const JS_TARGETS = [
-  "/api/events.host",
-  "/api/events.mux",
-  "/api/respond",
+  "/api/remote.mux",
   "/api/",
   "/plugins/events",
   "/plugins/",
@@ -115,7 +119,6 @@ const JS_TARGETS = [
   // WEB_UI_SETTINGS_BRIDGE_PREFIX + path where path is `"/describe"` /
   // `"/mutate"`, so a bare `/describe` target would double-prefix them into
   // /proxy/3100/api/dsh-web-ui-settings/proxy/3100/describe → 404.
-  "/aionui-panel/",
   "/git/",
   "/describe-image/",
   // `dsh-better-sidebar` serves its whole surface under /sidebar/:
@@ -125,6 +128,8 @@ const JS_TARGETS = [
   // the rewrite the browser resolves them against the code-server host root
   // (chunks 404, API POSTs 405).
   "/sidebar/",
+  "/pet/",
+  "/tree/",
   "/manifest.webmanifest",
   "/favicon.svg",
   "/api",
@@ -172,7 +177,13 @@ function pluginFallbackPrefix(s, base, quote) {
 
 function rewriteHtml(body, base) {
   if (base === "/") return body;
-  return prefixQuoted(body, base, '"', HTML_TARGETS);
+  let s = prefixQuoted(body, base, '"', HTML_TARGETS);
+  // dsh 0.1.2 injects `<base href="/">` into index.html and references its
+  // assets relatively (`./assets/…`, `./manifest.webmanifest`). Point the base
+  // at the forwarded subtree so every relative reference resolves under the
+  // base path without per-reference rewriting.
+  s = s.split('<base href="/">').join(`<base href="${base}/">`);
+  return s;
 }
 
 function rewriteJs(body, base) {
@@ -187,16 +198,30 @@ function rewriteJs(body, base) {
     .split("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~-]+$/")
     .join("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~\\/-]+$/");
   // dsh-client-connection derives connection.isLoopback from the browser's
-  // location.hostname. Through code-server that hostname is never loopback, so
-  // ui-settings switches its shared settings mirror to "memory" persistence and
-  // never reads the host — the Models page then fails to load its provider
-  // catalog with "settings are unavailable in this browser". The proxy already
-  // rewrites Host/Origin to the loopback upstream so the server-side fence
-  // passes; force the client flag true to match, so the settings RPCs are
-  // actually issued (and flow through the same loopback-looking path).
+  // location.hostname (unless a transport owns the host). Through code-server
+  // that hostname is never loopback; dsh 0.1.2's inlined remote-channel boot
+  // patch sets __DSH_TRANSPORT__.ownsHost on non-loopback pages which covers
+  // it — but only while that patch is present. Force the flag true to match
+  // the Host/Origin rewrite, so privileged settings RPCs are always issued.
+  // 0.1.2 literal first, the 0.1.1 form kept for symmetry (no-op if absent).
+  s = s
+    .split("isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),")
+    .join("isLoopback: true,");
   s = s
     .split("isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),")
     .join("isLoopback: true,");
+  // dsh-remote-web-ui 0.3.17 ships inside the @linxin666/dsh-web-all bundle
+  // and installs a fetch/WebSocket patch that reroutes its detector matches
+  // under `/remote`. Two problems under code-server: its detector table would
+  // be base-prefixed by the rewrite above (matching every real request and
+  // misrouting it to /remote/proxy/<port>/…, which dies at the code-server
+  // hop), and the fenced /remote mirror is unreachable through the port
+  // forward anyway. remoteChannelRequired() is the single gate for installing
+  // the channel; force it off in the proxy-served copy — exactly the inert
+  // behaviour the byte-for-byte exclusion produced for older dsh versions.
+  s = s
+    .split("function remoteChannelRequired(hostname, snapshot, hostPairingPolicy) {")
+    .join("function remoteChannelRequired(hostname, snapshot, hostPairingPolicy) { return false;");
   // Cover double-quoted, single-quoted and backtick forms uniformly (e.g.
   // vision-toolkit emits '/_dsh/...' with single quotes, dsh-pet emits
   // '/api/pet/pets' with single quotes, connection uses `/${method}`).
@@ -215,9 +240,17 @@ function needsRewrite(status, contentType, pathname = "") {
   // would turn those detectors into "/proxy/3100/api/…", so the channel then
   // misroutes every already-prefixed SDK call to /remote/proxy/3100/api/…,
   // which the code-server hop rejects with 405 before it ever reaches dsh.
-  // Serving this client byte-for-byte keeps the detectors correct; every real
-  // request URL in the main bundles is still rewritten as before.
-  if (pathname.startsWith("/plugins/@linxin666/dsh-remote-web-ui/client.js")) return false;
+  // When the client is addressable on its own (dsh ≤0.1.1 per-package URLs,
+  // and the 0.1.2 `??`-prefixed form), serving it byte-for-byte keeps the
+  // detectors correct. In 0.1.2 the code is compiled into the shared
+  // dsh-web-all bundle where exclusion is impossible; rewriteJs neutralises
+  // the channel gate there instead.
+  if (
+    pathname.startsWith("/plugins/@linxin666/dsh-remote-web-ui/client.js") ||
+    pathname.startsWith("/plugins/??@linxin666/dsh-remote-web-ui/client.js")
+  ) {
+    return false;
+  }
   const type = contentType.toLowerCase();
   return type.includes("text/html") || type.includes("javascript") || type.includes("application/manifest+json");
 }
@@ -270,6 +303,117 @@ function responseHeaders(headers) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// dsh 0.1.2 launch-token authentication
+// ---------------------------------------------------------------------------
+// dsh 0.1.2 fences the whole web UI — index and every /api RPC — behind a
+// browser cookie that is only minted when the launch URL's one-time query
+// token is presented on GET / (the fence applies to loopback too). The token
+// is printed once per `dsh web` process on stdout; it is reusable for further
+// handshakes, and the minted cookie is bound to the request authority, signed
+// with a secret persisted in the dsh home (30-day lifetime). The proxy:
+//   - captures the token from the spawned dsh's stdout (or PROXY_DSH_TOKEN
+//     when dsh is managed externally),
+//   - redirects a cookie-less browser entry (GET / without a dsh-auth cookie)
+//     through the handshake server-side, so opening /proxy/<port>/ keeps
+//     working with one click; the Set-Cookie of the 303 is passed through and
+//     the browser then holds the same authority-bound cookie a local browser
+//     would,
+//   - keeps its own minted cookie for internal RPC probes.
+let launchToken = process.env.PROXY_DSH_TOKEN || null;
+
+function hasAuthCookie(req) {
+  const cookie = req.headers.cookie || "";
+  return /(?:^|;\s*)dsh-auth-[^=]+=/.test(cookie);
+}
+
+// Rewrite root-absolute 3xx Location headers into the forwarded subtree.
+function rewriteLocation(headers) {
+  const out = responseHeaders(headers);
+  const loc = out.location;
+  if (typeof loc === "string" && loc.startsWith("/") && !loc.startsWith("//") && BASE !== "/") {
+    out.location = BASE + loc;
+  }
+  return out;
+}
+
+// Mint the proxy-internal auth cookie via the launch token (GET /?token=…).
+function handshakeCookie() {
+  return new Promise((resolve) => {
+    if (!launchToken) return resolve(null);
+    const r = http.get(
+      {
+        host: UPSTREAM_HOST,
+        port: UPSTREAM_PORT,
+        path: `/?token=${launchToken}`,
+        headers: { host: LOOPBACK_AUTHORITY, "accept-encoding": "identity" },
+      },
+      (res) => {
+        res.resume();
+        const setCookie = res.headers["set-cookie"];
+        if (res.statusCode === 303 && Array.isArray(setCookie) && setCookie.length > 0) {
+          const pair = setCookie[0].split(";")[0];
+          resolve(pair || null);
+          return;
+        }
+        resolve(null);
+      },
+    );
+    r.on("error", () => resolve(null));
+    r.setTimeout(2000, () => {
+      r.destroy();
+      resolve(null);
+    });
+  });
+}
+
+let authCookie = null;
+let authCookieInflight = null;
+async function ensureAuthCookie() {
+  if (authCookie) return authCookie;
+  if (!launchToken) return null;
+  if (!authCookieInflight) {
+    authCookieInflight = handshakeCookie()
+      .then((c) => {
+        authCookie = c;
+        return c;
+      })
+      .finally(() => {
+        authCookieInflight = null;
+      });
+  }
+  return authCookieInflight;
+}
+
+// Reply to a cookie-less browser entry with the token handshake: forward the
+// upstream 303 (Set-Cookie passes through; Location gets the base prefix), so
+// the next browser request arrives with a valid cookie.
+function handshakeRedirect(res) {
+  if (!launchToken || res.destroyed || res.headersSent) return false;
+  const r = http.get(
+    {
+      host: UPSTREAM_HOST,
+      port: UPSTREAM_PORT,
+      path: `/?token=${launchToken}`,
+      headers: { host: LOOPBACK_AUTHORITY, "accept-encoding": "identity" },
+    },
+    (upRes) => {
+      if (res.destroyed) return;
+      if (upRes.statusCode !== 303) {
+        // Token unknown upstream (rotated?): surface the raw response.
+        res.writeHead(upRes.statusCode, responseHeaders(upRes.headers));
+        upRes.pipe(res);
+        return;
+      }
+      upRes.resume();
+      res.writeHead(303, rewriteLocation(upRes.headers));
+      res.end();
+    },
+  );
+  r.on("error", () => sendUpstreamError(res, new Error("auth handshake failed")));
+  return true;
+}
+
 function sendUpstreamError(res, err) {
   if (res.headersSent) {
     res.destroy();
@@ -284,7 +428,22 @@ function sendUpstreamError(res, err) {
 // ---------------------------------------------------------------------------
 
 function forward(req, res) {
-  const targetPath = normalizePath(req.url);
+  let targetPath = normalizePath(req.url);
+
+  // Cookie-less browser entry: run the launch-token handshake server-side so
+  // opening the forwarded URL keeps working with one click. Only the plain
+  // index navigation qualifies; anything else keeps its 401 (a stale cookie
+  // mid-session recovers by reloading the root).
+  if (
+    req.method === "GET" &&
+    targetPath === "/" &&
+    !hasAuthCookie(req) &&
+    !(req.url || "").includes("token=") &&
+    launchToken
+  ) {
+    targetPath = `/?token=${launchToken}`;
+  }
+
   const headers = requestHeaders(req.headers);
 
   const upstream = http.request(
@@ -320,6 +479,13 @@ function forward(req, res) {
         }
       }
 
+      // Expired browser cookie on the index: fall back into the handshake so
+      // the session self-heals instead of surfacing a dead 401.
+      if (status === 401 && req.method === "GET" && targetPath === "/") {
+        upRes.resume();
+        if (handshakeRedirect(res)) return;
+      }
+
       if (needsRewrite(status, contentType, targetPath)) {
         // Rewritable responses are buffered (they are HTML/JS text, not large
         // binaries), rewritten, then sent with a recomputed content-length.
@@ -335,6 +501,12 @@ function forward(req, res) {
           res.end(body);
         });
         upRes.on("error", () => res.destroy());
+      } else if (status >= 300 && status < 400 && upRes.headers.location) {
+        // Redirects: pass through with a base-prefixed Location (the token
+        // handshake's 303 to `/` is the known case).
+        upRes.resume();
+        res.writeHead(status, rewriteLocation(upRes.headers));
+        res.end();
       } else {
         // Everything else (assets, streams, SSE, 404s, redirects, ...) is
         // piped through untouched, without buffering it in memory.
@@ -432,32 +604,40 @@ function upstreamReady() {
 // the fallback, which answers 405 (method not allowed) — the frontend treats
 // that as a real error and never retries, so the whole session list / history
 // / providers UI breaks during start-up. The readiness probe below watches the
-// RPC channel directly (host.describe answers 200 once the channel + apiProxy
-// are live) so the proxy can tell "dsh is still booting" from "dsh is broken".
+// RPC channel directly (agentPresets/list answers 200 once the channel + the
+// @Remote gateway are live) so the proxy can tell "dsh is still booting" from
+// "dsh is broken".
 let rpcReady = false;
 let rpcProbeScheduled = false;
 
-function probeRpcOnce() {
+async function probeRpcOnce() {
+  // 0.1.2 fences /api behind the browser cookie; the probe handshakes once
+  // with the captured launch token and re-mints whenever the cookie goes bad
+  // (dsh restart rotates nothing here, but expiry/secret changes do).
+  const cookie = await ensureAuthCookie();
   return new Promise((resolve) => {
     const body = JSON.stringify({
       type: "client-request",
       rpcId: "dsh-codeserver-proxy:probe",
-      method: "host.describe",
+      method: "agentPresets/list",
       payload: {},
     });
+    const headers = {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+    };
+    if (cookie) headers.cookie = cookie;
     const probe = http.request(
       {
         host: UPSTREAM_HOST,
         port: UPSTREAM_PORT,
-        path: "/api/host.describe",
+        path: "/api/agentPresets/list",
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
-        },
+        headers,
       },
       (probeRes) => {
         probeRes.resume();
+        if (probeRes.statusCode === 401) authCookie = null;
         resolve(probeRes.statusCode === 200);
       },
     );
@@ -510,11 +690,21 @@ async function ensureUpstream() {
     return;
   }
   console.log(`[dsh-codeserver-proxy] upstream not running, spawning dsh web on ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
-  const child = spawn("dsh", ["web", "--port", String(UPSTREAM_PORT)], {
+  const child = spawn("dsh", ["web", "--port", String(UPSTREAM_PORT), "--no-open"], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   dshChild = child;
-  child.stdout.on("data", (d) => process.stdout.write(`[dsh] ${d}`));
+  // dsh 0.1.2 prints the authenticated launch URL once on stdout; capture the
+  // one-time token so the proxy can run the cookie handshake for browsers.
+  child.stdout.on("data", (d) => {
+    const text = d.toString();
+    const m = text.match(/[?&]token=([A-Za-z0-9_-]+)/);
+    if (m) {
+      launchToken = m[1];
+      console.log("[dsh-codeserver-proxy] captured dsh web launch token");
+    }
+    process.stdout.write(`[dsh] ${text}`);
+  });
   child.stderr.on("data", (d) => process.stderr.write(`[dsh] ${d}`));
   child.on("exit", (code) => {
     if (dshChild === child) dshChild = null;
