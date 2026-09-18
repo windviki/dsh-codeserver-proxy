@@ -314,27 +314,31 @@ function responseHeaders(headers) {
 // with a secret persisted in the dsh home (30-day lifetime). The proxy:
 //   - captures the token from the spawned dsh's stdout (or PROXY_DSH_TOKEN
 //     when dsh is managed externally),
-//   - redirects a cookie-less browser entry (GET / without a dsh-auth cookie)
-//     through the handshake server-side, so opening /proxy/<port>/ keeps
-//     working with one click; the Set-Cookie of the 303 is passed through and
-//     the browser then holds the same authority-bound cookie a local browser
-//     would,
-//   - keeps its own minted cookie for internal RPC probes.
+//   - runs the handshake server-side for a browser entry that holds no (or a
+//     stale) dsh-auth cookie and hands that cookie to the browser on the index
+//     response itself — `Set-Cookie` on the 200, never a 3xx — so opening
+//     /proxy/<port>/ keeps working with one click,
+//   - keeps the minted cookie for its own internal RPC probes.
+//
+// The cookie is deliberately NOT handed over through the upstream's `303 → /`:
+// every hop in front of this proxy is free to prefix root-absolute redirects,
+// and code-server's path proxy does exactly that (out/node/proxy.js,
+// proxyRes hook: `location = req.base + location`). A base-prefixed Location
+// therefore came back as /proxy/<port>/proxy/<port>/ in the browser's address
+// bar, and the Location had to survive whatever the outer hop does. Serving
+// the index with Set-Cookie needs no Location at all and cannot double.
 let launchToken = process.env.PROXY_DSH_TOKEN || null;
 
-function hasAuthCookie(req) {
-  const cookie = req.headers.cookie || "";
-  return /(?:^|;\s*)dsh-auth-[^=]+=/.test(cookie);
-}
+let authCookie = null; // `name=value` presented to upstream
+let authCookieSetCookie = null; // full Set-Cookie value handed to the browser
 
-// Rewrite root-absolute 3xx Location headers into the forwarded subtree.
-function rewriteLocation(headers) {
-  const out = responseHeaders(headers);
-  const loc = out.location;
-  if (typeof loc === "string" && loc.startsWith("/") && !loc.startsWith("//") && BASE !== "/") {
-    out.location = BASE + loc;
-  }
-  return out;
+// The exact generated dsh-auth cookie the browser sent, if any. dsh names the
+// cookie `dsh-auth-<sha256(authority)>` and binds the payload to the same
+// authority, so a browser cookie either is the cookie this proxy would mint
+// (same authority) or is stale — comparing the whole pair catches both.
+function browserAuthPair(req) {
+  const m = (req.headers.cookie || "").match(/(?:^|;\s*)(dsh-auth-[^=]*=[^;]*)/);
+  return m ? m[1] : null;
 }
 
 // Mint the proxy-internal auth cookie via the launch token (GET /?token=…).
@@ -351,9 +355,10 @@ function handshakeCookie() {
       (res) => {
         res.resume();
         const setCookie = res.headers["set-cookie"];
-        if (res.statusCode === 303 && Array.isArray(setCookie) && setCookie.length > 0) {
-          const pair = setCookie[0].split(";")[0];
-          resolve(pair || null);
+        const full = Array.isArray(setCookie) ? setCookie[0] : undefined;
+        if (res.statusCode === 303 && typeof full === "string") {
+          const pair = full.split(";")[0];
+          resolve(pair ? { pair, setCookie: full } : null);
           return;
         }
         resolve(null);
@@ -367,16 +372,18 @@ function handshakeCookie() {
   });
 }
 
-let authCookie = null;
 let authCookieInflight = null;
 async function ensureAuthCookie() {
   if (authCookie) return authCookie;
   if (!launchToken) return null;
   if (!authCookieInflight) {
     authCookieInflight = handshakeCookie()
-      .then((c) => {
-        authCookie = c;
-        return c;
+      .then((minted) => {
+        if (minted) {
+          authCookie = minted.pair;
+          authCookieSetCookie = minted.setCookie;
+        }
+        return authCookie;
       })
       .finally(() => {
         authCookieInflight = null;
@@ -385,33 +392,20 @@ async function ensureAuthCookie() {
   return authCookieInflight;
 }
 
-// Reply to a cookie-less browser entry with the token handshake: forward the
-// upstream 303 (Set-Cookie passes through; Location gets the base prefix), so
-// the next browser request arrives with a valid cookie.
-function handshakeRedirect(res) {
-  if (!launchToken || res.destroyed || res.headersSent) return false;
-  const r = http.get(
-    {
-      host: UPSTREAM_HOST,
-      port: UPSTREAM_PORT,
-      path: `/?token=${launchToken}`,
-      headers: { host: LOOPBACK_AUTHORITY, "accept-encoding": "identity" },
-    },
-    (upRes) => {
-      if (res.destroyed) return;
-      if (upRes.statusCode !== 303) {
-        // Token unknown upstream (rotated?): surface the raw response.
-        res.writeHead(upRes.statusCode, responseHeaders(upRes.headers));
-        upRes.pipe(res);
-        return;
-      }
-      upRes.resume();
-      res.writeHead(303, rewriteLocation(upRes.headers));
-      res.end();
-    },
-  );
-  r.on("error", () => sendUpstreamError(res, new Error("auth handshake failed")));
-  return true;
+function invalidateAuthCookie() {
+  authCookie = null;
+  authCookieSetCookie = null;
+}
+
+// Attach the minted cookie to an outgoing response, keeping any Set-Cookie the
+// upstream sent (the handshake's own header is the array-typed case).
+function withInjectedCookie(headers, setCookie) {
+  if (!setCookie) return headers;
+  const existing = headers["set-cookie"];
+  const list = existing === undefined ? [] : Array.isArray(existing) ? existing.slice() : [existing];
+  if (!list.includes(setCookie)) list.push(setCookie);
+  headers["set-cookie"] = list;
+  return headers;
 }
 
 function sendUpstreamError(res, err) {
@@ -427,110 +421,152 @@ function sendUpstreamError(res, err) {
 // Proxy handler
 // ---------------------------------------------------------------------------
 
-function forward(req, res) {
-  let targetPath = normalizePath(req.url);
+async function forward(req, res) {
+  const targetPath = normalizePath(req.url);
+  const headers = requestHeaders(req.headers);
+  // Plain index navigation with a launch token available: the browser is about
+  // to be served the application shell, so it is also the right moment to make
+  // sure it holds a usable dsh-auth cookie. A request that already carries a
+  // `?token=` is left alone (its upstream 303 → / becomes the clean
+  // /proxy/<port>/ under code-server, which re-prefixes it itself).
+  const isIndexEntry = req.method === "GET" && targetPath === "/" && Boolean(launchToken);
+  let injectSetCookie = null;
 
-  // Cookie-less browser entry: run the launch-token handshake server-side so
-  // opening the forwarded URL keeps working with one click. Only the plain
-  // index navigation qualifies; anything else keeps its 401 (a stale cookie
-  // mid-session recovers by reloading the root).
-  if (
-    req.method === "GET" &&
-    targetPath === "/" &&
-    !hasAuthCookie(req) &&
-    !(req.url || "").includes("token=") &&
-    launchToken
-  ) {
-    targetPath = `/?token=${launchToken}`;
+  if (isIndexEntry) {
+    const cookie = await ensureAuthCookie();
+    if (cookie !== null) {
+      headers.cookie = cookie;
+      // Hand the cookie over whenever the browser's copy is missing or differs
+      // from the one this proxy validated (stale cookie after a secret
+      // rotation), so the whole session — not just the index — is authorized.
+      if (browserAuthPair(req) !== cookie) injectSetCookie = authCookieSetCookie;
+    }
   }
 
-  const headers = requestHeaders(req.headers);
+  let inflight = null;
 
-  const upstream = http.request(
-    {
-      host: UPSTREAM_HOST,
-      port: UPSTREAM_PORT,
-      path: targetPath,
-      method: req.method,
-      headers,
-    },
-    (upRes) => {
-      const status = upRes.statusCode;
-      const contentType = upRes.headers["content-type"] || "";
+  const handleResponse = (upRes, attempt) => {
+    const status = upRes.statusCode;
+    const contentType = upRes.headers["content-type"] || "";
 
-      // dsh's only source of 405 is the static-files fallback rejecting a
-      // non-GET/HEAD request no registered route claims — during start-up the
-      // RPC channel `/api` is not registered yet, so POST /api/* answers 405.
-      // The frontend treats that as a real Method Not Allowed and never
-      // retries. Report a transient 503 (with retry-after) instead and keep
-      // the readiness probe spinning; once dsh finishes booting the next
-      // request succeeds. A 405 on a live channel is anomalous and passes
-      // through untouched.
-      if (status === 405 && req.method === "POST" && targetPath.startsWith("/api")) {
-        upRes.resume();
-        ensureRpcProbe();
-        if (!rpcReady) {
-          res.writeHead(503, {
-            "content-type": "text/plain; charset=utf-8",
-            "retry-after": "2",
-          });
-          res.end("dsh-codeserver-proxy: dsh web is still starting up; refresh in a moment");
-          return;
-        }
-      }
-
-      // Expired browser cookie on the index: fall back into the handshake so
-      // the session self-heals instead of surfacing a dead 401.
-      if (status === 401 && req.method === "GET" && targetPath === "/") {
-        upRes.resume();
-        if (handshakeRedirect(res)) return;
-      }
-
-      if (needsRewrite(status, contentType, targetPath)) {
-        // Rewritable responses are buffered (they are HTML/JS text, not large
-        // binaries), rewritten, then sent with a recomputed content-length.
-        const chunks = [];
-        upRes.on("data", (c) => chunks.push(c));
-        upRes.on("end", () => {
+    // The index answered 401 even though the proxy sent its minted cookie: the
+    // cookie went stale (rotated dsh home secret, expired). Drop it, handshake
+    // once more and retry the same request with the fresh cookie; that retry is
+    // a bodiless GET, so it is written straight to the wire rather than piped.
+    if (status === 401 && isIndexEntry && attempt === 1) {
+      upRes.resume();
+      invalidateAuthCookie();
+      ensureAuthCookie()
+        .then((cookie) => {
           if (res.destroyed) return;
-          const raw = Buffer.concat(chunks).toString("utf8");
-          const body = Buffer.from(rewriteBody(raw, BASE, contentType));
-          const outHeaders = responseHeaders(upRes.headers);
-          outHeaders["content-length"] = String(body.length);
-          res.writeHead(status, outHeaders);
-          res.end(body);
-        });
-        upRes.on("error", () => res.destroy());
-      } else if (status >= 300 && status < 400 && upRes.headers.location) {
-        // Redirects: pass through with a base-prefixed Location (the token
-        // handshake's 303 to `/` is the known case).
-        upRes.resume();
-        res.writeHead(status, rewriteLocation(upRes.headers));
-        res.end();
-      } else {
-        // Everything else (assets, streams, SSE, 404s, redirects, ...) is
-        // piped through untouched, without buffering it in memory.
-        const outHeaders = responseHeaders(upRes.headers);
-        if (res.destroyed) {
-          upRes.destroy();
-          return;
-        }
-        res.writeHead(status, outHeaders);
-        upRes.pipe(res);
-        upRes.on("error", () => res.destroy());
-      }
-    },
-  );
+          if (cookie === null) {
+            // No token configured, or the upstream no longer accepts it: report
+            // the fence instead of looping. The body is rewritten so a stale
+            // content-length from upstream can never hang the client.
+            const body = Buffer.from("dsh-codeserver-proxy: dsh web authentication required (no valid launch token)\n");
+            const staleHeaders = withInjectedCookie(responseHeaders(upRes.headers), injectSetCookie);
+            staleHeaders["content-type"] = "text/plain; charset=utf-8";
+            staleHeaders["content-length"] = String(body.length);
+            res.writeHead(401, staleHeaders);
+            res.end(body);
+            return;
+          }
+          headers.cookie = cookie;
+          injectSetCookie = authCookieSetCookie;
+          dispatch(2);
+        })
+        .catch((err) => sendUpstreamError(res, err));
+      return;
+    }
 
-  upstream.on("error", (err) => sendUpstreamError(res, err));
-  req.on("error", () => upstream.destroy());
-  // Client can drop the response mid-flight (abort, RST); swallow so the
-  // process never dies on an unhandled socket error.
-  res.on("error", () => upstream.destroy());
-  req.pipe(upstream);
+    // dsh's only source of 405 is the static-files fallback rejecting a
+    // non-GET/HEAD request no registered route claims — during start-up the
+    // RPC channel `/api` is not registered yet, so POST /api/* answers 405.
+    // The frontend treats that as a real Method Not Allowed and never
+    // retries. Report a transient 503 (with retry-after) instead and keep
+    // the readiness probe spinning; once dsh finishes booting the next
+    // request succeeds. A 405 on a live channel is anomalous and passes
+    // through untouched.
+    if (status === 405 && req.method === "POST" && targetPath.startsWith("/api")) {
+      upRes.resume();
+      ensureRpcProbe();
+      if (!rpcReady) {
+        res.writeHead(503, {
+          "content-type": "text/plain; charset=utf-8",
+          "retry-after": "2",
+        });
+        res.end("dsh-codeserver-proxy: dsh web is still starting up; refresh in a moment");
+        return;
+      }
+    }
+
+    if (needsRewrite(status, contentType, targetPath)) {
+      // Rewritable responses are buffered (they are HTML/JS text, not large
+      // binaries), rewritten, then sent with a recomputed content-length.
+      const chunks = [];
+      upRes.on("data", (c) => chunks.push(c));
+      upRes.on("end", () => {
+        if (res.destroyed) return;
+        const raw = Buffer.concat(chunks).toString("utf8");
+        const body = Buffer.from(rewriteBody(raw, BASE, contentType));
+        const outHeaders = withInjectedCookie(responseHeaders(upRes.headers), injectSetCookie);
+        outHeaders["content-length"] = String(body.length);
+        res.writeHead(status, outHeaders);
+        res.end(body);
+      });
+      upRes.on("error", () => res.destroy());
+    } else if (status >= 300 && status < 400 && upRes.headers.location) {
+      // Redirects pass through verbatim. Root-absolute Locations are the outer
+      // hop's business: code-server's path proxy already prepends its own base
+      // to them, so prefixing here would produce /proxy/<port>/proxy/<port>/.
+      upRes.resume();
+      res.writeHead(status, withInjectedCookie(responseHeaders(upRes.headers), injectSetCookie));
+      res.end();
+    } else {
+      // Everything else (assets, streams, SSE, 404s, ...) is piped through
+      // untouched, without buffering it in memory.
+      const outHeaders = withInjectedCookie(responseHeaders(upRes.headers), injectSetCookie);
+      if (res.destroyed) {
+        upRes.destroy();
+        return;
+      }
+      res.writeHead(status, outHeaders);
+      upRes.pipe(res);
+      upRes.on("error", () => res.destroy());
+    }
+  };
+
+  const dispatch = (attempt) => {
+    const upstream = http.request(
+      {
+        host: UPSTREAM_HOST,
+        port: UPSTREAM_PORT,
+        path: targetPath,
+        method: req.method,
+        headers,
+      },
+      (upRes) => handleResponse(upRes, attempt),
+    );
+    inflight = upstream;
+    upstream.on("error", (err) => sendUpstreamError(res, err));
+    // The 401 retry only ever happens for the bodiless index GET; piping the
+    // request again after its 'end' has already fired would hang the upstream.
+    if (attempt === 1) req.pipe(upstream);
+    else upstream.end();
+  };
+
+  // Client can drop the request/response mid-flight (abort, RST); swallow so
+  // the process never dies on an unhandled socket error.
+  req.on("error", () => inflight?.destroy());
+  res.on("error", () => inflight?.destroy());
+  dispatch(1);
 }
 
-const server = http.createServer(forward);
+// forward() awaits the auth-cookie handshake, so its rejection must never
+// escape as an unhandled rejection (Node would tear the process down).
+const server = http.createServer((req, res) => {
+  forward(req, res).catch((err) => sendUpstreamError(res, err));
+});
 server.on("clientError", (err, socket) => socket.destroy());
 
 // WebSocket downlinks (/api/events.mux, /api/events.host) pass through the same

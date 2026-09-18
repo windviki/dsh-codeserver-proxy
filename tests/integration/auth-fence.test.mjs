@@ -6,8 +6,11 @@
 // cookie answers 401, GET /?token=… answers 303 + Set-Cookie, and every /api
 // RPC demands the cookie as well. The proxy must:
 //   - capture the token (here: PROXY_DSH_TOKEN, the externally-managed path)
-//   - run the handshake server-side for a cookie-less entry and hand the
-//     browser the 303 with a base-prefixed Location and the Set-Cookie intact
+//   - run the handshake server-side for a cookie-less (or stale-cookie) entry
+//     and hand the cookie to the browser on the index 200 itself — never via a
+//     3xx, because the hop in front (code-server) prepends its own base to
+//     root-absolute Locations and the two prefixes would stack into
+//     /proxy/<port>/proxy/<port>/
 //   - pass authenticated traffic through unchanged
 //   - repoint the injected <base href="/"> at the forwarded subtree while
 //     leaving the inlined remote-channel boot patch's detector table alone
@@ -67,6 +70,9 @@ class StubUpstream {
   constructor(port) {
     this.port = port;
     this.seen = { paths: [] };
+    // Force the next index request to answer 401 even with a valid cookie, to
+    // exercise the proxy's "cookie went stale → re-handshake → retry" path.
+    this.rejectNextIndex = false;
     this.server = http.createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://x");
       this.seen.paths.push(req.method + " " + url.pathname + url.search);
@@ -80,7 +86,20 @@ class StubUpstream {
         res.end();
         return;
       }
+      if (req.method === "GET" && url.pathname === "/legacy-redirect") {
+        // A root-absolute redirect straight from upstream: code-server prepends
+        // its own base to this, so the proxy must forward it verbatim.
+        res.writeHead(302, { location: "/" });
+        res.end();
+        return;
+      }
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+        if (this.rejectNextIndex) {
+          this.rejectNextIndex = false;
+          res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
+          res.end("dsh web authentication required; reopen the URL printed by dsh web.\n");
+          return;
+        }
         if (!authed) {
           res.writeHead(401, { "content-type": "text/plain; charset=utf-8" });
           res.end("dsh web authentication required; reopen the URL printed by dsh web.\n");
@@ -193,15 +212,48 @@ describe("proxy.js dsh 0.1.2 auth fence + rewrite anchors", () => {
     await stub?.close();
   });
 
-  test("无 cookie 首次进入: 代理代跑 token 握手, 303 Location 带 base 前缀且 Set-Cookie 透传", async () => {
+  test("无 cookie 首次进入: 代理代跑 token 握手, 直接 200 首页 + Set-Cookie, 不产生 3xx/Location", async () => {
+    const before = stub.seen.paths.length;
     const r = await request(proxyPort, base + "/");
-    assert.equal(r.status, 303);
-    assert.equal(r.location, base + "/", "Location 应改写为 base 前缀");
-    assert.ok(r.setCookie?.some((c) => c.startsWith(`${COOKIE_NAME}=${COOKIE_VALUE}`)), "Set-Cookie 应原样透传");
+    assert.equal(r.status, 200, "应以首页直接应答, 而不是 303 重定向");
+    assert.equal(r.location, undefined, "不得产生 Location——外层 code-server 会再叠加一层 base 前缀");
     assert.ok(
-      stub.seen.paths.some((p) => p === `GET /?token=${TOKEN}`),
-      "上游应收到带 token 的握手请求, 实际: " + JSON.stringify(stub.seen.paths.slice(-3)),
+      r.setCookie?.some((c) => c.startsWith(`${COOKIE_NAME}=${COOKIE_VALUE}`)),
+      "换来的 cookie 应通过 Set-Cookie 交给浏览器",
     );
+    assert.match(r.body, new RegExp(`<base href="${base}/">`), "首页应正常改写 base 标签");
+    const seen = stub.seen.paths.slice(before);
+    assert.ok(seen.includes(`GET /?token=${TOKEN}`), "上游应收到带 token 的握手请求, 实际: " + JSON.stringify(seen));
+    assert.ok(seen.includes("GET /"), "首页请求应带上换来的 cookie, 实际: " + JSON.stringify(seen));
+  });
+
+  test("浏览器带过期 dsh-auth cookie: 用代理 cookie 重取首页并补发有效的 Set-Cookie", async () => {
+    const r = await request(proxyPort, base + "/", { headers: { cookie: `${COOKIE_NAME}=v1.stale-payload` } });
+    assert.equal(r.status, 200, "过期 cookie 不应把首页卡死在 401");
+    assert.ok(
+      r.setCookie?.some((c) => c.startsWith(`${COOKIE_NAME}=${COOKIE_VALUE}`)),
+      "应补发有效 cookie, 让后续 /api 请求也能通过围栏",
+    );
+  });
+
+  test("代理 cookie 过期 (上游 401): 重新握手并重试一次, 仍返回首页 + Set-Cookie", async () => {
+    stub.rejectNextIndex = true;
+    const before = stub.seen.paths.length;
+    const r = await request(proxyPort, base + "/", { headers: { cookie: `${COOKIE_NAME}=${COOKIE_VALUE}` } });
+    assert.equal(r.status, 200, "重握手后应恢复 200");
+    assert.ok(
+      r.setCookie?.some((c) => c.startsWith(`${COOKIE_NAME}=${COOKIE_VALUE}`)),
+      "重换的 cookie 应交给浏览器",
+    );
+    const seen = stub.seen.paths.slice(before);
+    assert.equal(seen.filter((p) => p.startsWith("GET /?token=")).length, 1, "应重新握手一次, 实际: " + JSON.stringify(seen));
+    assert.equal(seen.filter((p) => p === "GET /").length, 2, "应重试一次首页请求, 实际: " + JSON.stringify(seen));
+  });
+
+  test("上游根绝对 Location 原样透传: base 前缀由外层 code-server 补, 代理不能再补一次", async () => {
+    const r = await request(proxyPort, base + "/legacy-redirect");
+    assert.equal(r.status, 302);
+    assert.equal(r.location, "/", "Location 不得被改写, 否则会变成 " + base + base + "/");
   });
 
   test("带 cookie 访问首页: 200 HTML, base 标签指向转发子树", async () => {
