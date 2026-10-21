@@ -17,9 +17,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
-# ---------- 配置（.env 可覆盖，默认与 proxy.js 一致） ----------
-PROXY_PORT=3100
-UPSTREAM_PORT=3000
+# ---------- 配置（.env 可覆盖，默认为本机部署布局：/proxy/3000 直接访问） ----------
+PROXY_PORT=3000
+UPSTREAM_PORT=3001
 if [[ -f .env ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
