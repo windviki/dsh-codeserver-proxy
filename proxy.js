@@ -176,6 +176,14 @@ function pluginFallbackPrefix(s, base, quote) {
 }
 
 function rewriteHtml(body, base) {
+  // The 0.2.1-native marker: dsh emits `<base href="./">` and fully relative
+  // asset refs exactly in the generation whose client anchors every path on
+  // document.baseURI. Latch it before the JS passes run — the index is always
+  // the first rewritable response a browser fetches.
+  if (body.includes('<base href="./">') && !nativeBaseClient) {
+    nativeBaseClient = true;
+    console.log("[dsh-codeserver-proxy] dsh >=0.2.1 subdirectory-native client detected; prefix rewrites disabled");
+  }
   if (base === "/") return body;
   let s = prefixQuoted(body, base, '"', HTML_TARGETS);
   // dsh 0.1.2 injects `<base href="/">` into index.html and references its
@@ -186,14 +194,27 @@ function rewriteHtml(body, base) {
   return s;
 }
 
+// dsh ≥0.2.1 is subdirectory-native: index.html ships `<base href="./">` and
+// every client path is anchored on document.baseURI with leading slashes
+// stripped (their #345 fix for reverse-proxy prefix deployments — exactly
+// code-server's /proxy/<port>/ shape). The bundle therefore needs NO prefix
+// rewriting at all; worse, prefixing "/api/…"-style literals there makes the
+// client join the page directory twice (/proxy/<port>/proxy/<port>/api/…), so
+// every RPC 404s and the connection WebSocket retry-loops into a blank page.
+// Detected from the served index — the version marker dsh itself emits — and
+// gates the prefix passes below; the loopback/remote-gate neutralizations stay
+// (they correct the proxy environment, not the path shape).
+let nativeBaseClient = false;
+
 function rewriteJs(body, base) {
-  if (base === "/") return body;
   let s = body;
   // The base path rewrites `/api` (the RPC channel) to `/proxy/3100/api`,
   // but connection's assertTarget rejects a channel with more than one slash
   // (`CHANNEL_PATTERN = /^\/[A-Za-z0-9._~-]+$/`). Widen the class to accept
   // `/`, so the rewritten multi-segment channel passes validation while the
   // URL built from it (`${channel}/${endpoint}`) still carries the base path.
+  // Harmless in native mode (channel stays single-segment; the wider class
+  // accepts it too).
   s = s
     .split("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~-]+$/")
     .join("CHANNEL_PATTERN = /^\\/[A-Za-z0-9._~\\/-]+$/");
@@ -210,7 +231,7 @@ function rewriteJs(body, base) {
   s = s
     .split("isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),")
     .join("isLoopback: true,");
-  // dsh-remote-web-ui 0.3.17 ships inside the @linxin666/dsh-web-all bundle
+  // dsh-remote-web-ui 0.3.17+ ships inside the @linxin666/dsh-web-all bundle
   // and installs a fetch/WebSocket patch that reroutes its detector matches
   // under `/remote`. Two problems under code-server: its detector table would
   // be base-prefixed by the rewrite above (matching every real request and
@@ -219,9 +240,28 @@ function rewriteJs(body, base) {
   // forward anyway. remoteChannelRequired() is the single gate for installing
   // the channel; force it off in the proxy-served copy — exactly the inert
   // behaviour the byte-for-byte exclusion produced for older dsh versions.
+  // 0.2.0 form first (hostname param), then the 0.2.1 form (param renamed to
+  // `origin` and the body reflowed) — kept for symmetry (no-op if absent).
   s = s
     .split("function remoteChannelRequired(hostname, snapshot, hostPairingPolicy) {")
     .join("function remoteChannelRequired(hostname, snapshot, hostPairingPolicy) { return false;");
+  s = s
+    .split("function remoteChannelRequired(origin, snapshot, hostPairingPolicy) {")
+    .join("function remoteChannelRequired(origin, snapshot, hostPairingPolicy) { return false;");
+  // dsh 0.2.1's remote-web-ui client boots a pairing gate on every page whose
+  // hostname is not loopback: it fetches api/pair/status and — whether that
+  // says pairing is required or the fetch itself fails — showFenceNotice()
+  // renders the "open the token URL" auth wall. Through code-server the
+  // browser hostname is the forwarding host, never loopback, so the gate
+  // fired on every load even though the proxy had already authenticated the
+  // session server-side. isLocalPage() is the root predicate for both the
+  // gate and the channel requirement; force it true — under this proxy the
+  // page IS the loopback same-origin peer dsh sees on the wire.
+  s = s
+    .split("function isLocalPage(hostname, protocol, transportOwnsHost) {")
+    .join("function isLocalPage(hostname, protocol, transportOwnsHost) { return true;");
+  if (nativeBaseClient || base === "/") return s;
+  // Prefix passes — only for the pre-0.2.1 (root-absolute fetch) generation.
   // Cover double-quoted, single-quoted and backtick forms uniformly (e.g.
   // vision-toolkit emits '/_dsh/...' with single quotes, dsh-pet emits
   // '/api/pet/pets' with single quotes, connection uses `/${method}`).
@@ -252,13 +292,37 @@ function needsRewrite(status, contentType, pathname = "") {
     return false;
   }
   const type = contentType.toLowerCase();
-  return type.includes("text/html") || type.includes("javascript") || type.includes("application/manifest+json");
+  if (type.includes("text/html") || type.includes("javascript") || type.includes("application/manifest+json")) {
+    return true;
+  }
+  // Pet plugin JSON is rewritten too (see rewritePetJson): its bodies carry
+  // root-absolute asset URLs (atlasUrl "/pet/<id>/spritesheet.webp",
+  // decoration entryUrl "/api/pet/decoration/…") that the pet client feeds
+  // straight into `new Image()`/background-image. Unprefixed, they resolve
+  // against the code-server host root and 404, so the sprite preload never
+  // completes and the pet renders only its overlay chrome (imageReady gate).
+  // Scoped to /api/pet/* responses only — chat/settings JSON stays untouched.
+  // Skipped in native mode: the 0.4.7 pet client anchors on document.baseURI
+  // like the rest of the 0.2.1 generation, so prefixing would double.
+  if (type.includes("application/json") && pathname.startsWith("/api/pet/") && !nativeBaseClient) return true;
+  return false;
 }
 
-function rewriteBody(body, base, contentType) {
+function rewriteBody(body, base, contentType, pathname = "") {
   const type = contentType.toLowerCase();
   if (type.includes("text/html") || type.includes("application/manifest+json")) return rewriteHtml(body, base);
+  if (type.includes("application/json") && pathname.startsWith("/api/pet/") && !nativeBaseClient) {
+    return rewritePetJson(body, base);
+  }
   return rewriteJs(body, base);
+}
+
+// Prefix the root-absolute pet asset URLs inside /api/pet/* JSON string
+// values. Single pass with a value-anchored pattern, so the "/pet/" inside an
+// already-rewritten "/proxy/<port>/api/pet/…" can never be prefixed twice.
+function rewritePetJson(body, base) {
+  if (base === "/") return body;
+  return body.replace(/"(\/(?:api\/)?pet\/[^"]*)"/g, (_whole, path) => `"${base}${path}"`);
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +572,7 @@ async function forward(req, res) {
       upRes.on("end", () => {
         if (res.destroyed) return;
         const raw = Buffer.concat(chunks).toString("utf8");
-        const body = Buffer.from(rewriteBody(raw, BASE, contentType));
+        const body = Buffer.from(rewriteBody(raw, BASE, contentType, targetPath));
         const outHeaders = withInjectedCookie(responseHeaders(upRes.headers), injectSetCookie);
         outHeaders["content-length"] = String(body.length);
         res.writeHead(status, outHeaders);
