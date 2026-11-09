@@ -260,7 +260,17 @@ function rewriteJs(body, base) {
   s = s
     .split("function isLocalPage(hostname, protocol, transportOwnsHost) {")
     .join("function isLocalPage(hostname, protocol, transportOwnsHost) { return true;");
-  if (nativeBaseClient || base === "/") return s;
+  if (nativeBaseClient) {
+    // dsh-pet 0.4.12 is the one 0.2.1-generation plugin that still fetches
+    // root-absolute API paths: its client bundle calls `/api/pet/*` directly
+    // (no document.baseURI anchoring in that bundle), so under a subdirectory
+    // mount every poll (~2 s) dies at the code-server origin root and floods
+    // DevTools with 404s. Prefix only that API surface; dsh's own client stays
+    // relative and must not be double-prefixed.
+    if (base !== "/") for (const q of ['"', "'", "`"]) s = prefixQuoted(s, base, q, ["/api/pet/"]);
+    return s;
+  }
+  if (base === "/") return s;
   // Prefix passes — only for the pre-0.2.1 (root-absolute fetch) generation.
   // Cover double-quoted, single-quoted and backtick forms uniformly (e.g.
   // vision-toolkit emits '/_dsh/...' with single quotes, dsh-pet emits
@@ -302,16 +312,19 @@ function needsRewrite(status, contentType, pathname = "") {
   // against the code-server host root and 404, so the sprite preload never
   // completes and the pet renders only its overlay chrome (imageReady gate).
   // Scoped to /api/pet/* responses only — chat/settings JSON stays untouched.
-  // Skipped in native mode: the 0.4.7 pet client anchors on document.baseURI
-  // like the rest of the 0.2.1 generation, so prefixing would double.
-  if (type.includes("application/json") && pathname.startsWith("/api/pet/") && !nativeBaseClient) return true;
+  // Applies in native mode too: the 0.4.12 pet client fetches its JSON through
+  // the (now base-prefixed) JS literals and feeds the asset URLs inside
+  // straight into `new Image()`/background-image, so they need the same base.
+  // The rewrite is a single value-anchored pass, so already-prefixed values
+  // can never be prefixed twice.
+  if (type.includes("application/json") && pathname.startsWith("/api/pet/")) return true;
   return false;
 }
 
 function rewriteBody(body, base, contentType, pathname = "") {
   const type = contentType.toLowerCase();
   if (type.includes("text/html") || type.includes("application/manifest+json")) return rewriteHtml(body, base);
-  if (type.includes("application/json") && pathname.startsWith("/api/pet/") && !nativeBaseClient) {
+  if (type.includes("application/json") && pathname.startsWith("/api/pet/")) {
     return rewritePetJson(body, base);
   }
   return rewriteJs(body, base);
@@ -794,15 +807,28 @@ async function ensureUpstream() {
     stdio: ["ignore", "pipe", "pipe"],
   });
   dshChild = child;
-  // dsh 0.1.2 prints the authenticated launch URL once on stdout; capture the
-  // one-time token so the proxy can run the cookie handshake for browsers.
+  // dsh prints the authenticated launch URL once on stdout; capture the token
+  // so the proxy can run the cookie handshake for browsers. Match only the
+  // `dsh web: http://...?token=` line: later output (the remote-bridge pairing
+  // URL) also carries a `token=` query parameter, and a generic match used to
+  // overwrite the launch token with it — after which a proxy restart could no
+  // longer mint a cookie for a fresh browser.
+  let stdoutBuffer = "";
   child.stdout.on("data", (d) => {
     const text = d.toString();
-    const m = text.match(/[?&]token=([A-Za-z0-9_-]+)/);
-    if (m) {
-      launchToken = m[1];
-      console.log("[dsh-codeserver-proxy] captured dsh web launch token");
+    stdoutBuffer += text;
+    let newline;
+    while ((newline = stdoutBuffer.indexOf("\n")) !== -1) {
+      const line = stdoutBuffer.slice(0, newline).replace(/\r$/, "");
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      const m = line.match(/dsh web: http:\/\/\S*?\?token=([A-Za-z0-9_-]+)/);
+      if (m) {
+        launchToken = m[1];
+        console.log("[dsh-codeserver-proxy] captured dsh web launch token");
+      }
     }
+    // Keep a pathological partial line from growing without bound.
+    if (stdoutBuffer.length > 64 * 1024) stdoutBuffer = stdoutBuffer.slice(-1024);
     process.stdout.write(`[dsh] ${text}`);
   });
   child.stderr.on("data", (d) => process.stderr.write(`[dsh] ${d}`));
